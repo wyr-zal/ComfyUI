@@ -6,10 +6,13 @@ import json
 import math
 import mimetypes
 import os
+import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from typing import Any
@@ -26,6 +29,18 @@ from .config_store import RemoteMediaConfig, get_config_dir
 
 class CompanyRemoteAPIError(RuntimeError):
     pass
+
+
+SEEDANCE_REFERENCE_VIDEO_MAX_SECONDS = 15.2
+SEEDANCE_REFERENCE_VIDEO_TRIM_SECONDS = 15.0
+
+
+@dataclass(frozen=True)
+class _PreparedVideo:
+    content: bytes
+    mime: str
+    extension: str
+    source_info: dict[str, Any]
 
 
 _THREAD_LOCAL = threading.local()
@@ -192,6 +207,209 @@ def generate_openai_image_prompt_text(
     if not text:
         raise CompanyRemoteAPIError("Response did not contain text path 'choices.0.message.content' or 'output_text'.")
     return _normalize_prompt_text(text)
+
+
+def generate_dashscope_image(
+    config: RemoteMediaConfig,
+    *,
+    prompt: str,
+    model: str,
+    size: str,
+    negative_prompt: str = "",
+    n: int = 1,
+    prompt_extend: bool = True,
+    watermark: bool = False,
+    seed: int = 0,
+    reference_images: list[Any] | None = None,
+):
+    prompt = _normalize_prompt_text(prompt)
+    image_count = int(n)
+    if not 1 <= image_count <= 6:
+        raise CompanyRemoteAPIError("Qwen Image 2.0 supports between 1 and 6 output images.")
+
+    parameters: dict[str, Any] = {
+        "size": str(size).replace("x", "*"),
+        "prompt_extend": bool(prompt_extend),
+        "watermark": bool(watermark),
+        "seed": int(seed),
+    }
+    if image_count != 1:
+        parameters["n"] = image_count
+    if str(negative_prompt).strip():
+        parameters["negative_prompt"] = str(negative_prompt).strip()
+
+    reference_images = [item for item in (reference_images or []) if item is not None]
+    if len(reference_images) > 3:
+        raise CompanyRemoteAPIError("Qwen Image 2.0 image editing supports at most 3 reference images.")
+    content: list[dict[str, str]] = [
+        {"image": _image_to_data_uri(item, config.image_format)}
+        for item in reference_images
+    ]
+    content.append({"text": prompt})
+    payload = {
+        "model": str(model).strip(),
+        "input": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": content,
+                }
+            ]
+        },
+        "parameters": parameters,
+    }
+    response_data = _submit(config, payload)
+    choices = _extract_value(response_data, "output.choices")
+    image_payloads: list[str] = []
+    if isinstance(choices, list):
+        for choice in choices:
+            content = _extract_value(choice, "message.content")
+            if isinstance(content, list):
+                image_payloads.extend(
+                    str(item.get("image"))
+                    for item in content
+                    if isinstance(item, dict) and item.get("image")
+                )
+    if not image_payloads:
+        raise CompanyRemoteAPIError(
+            "DashScope response did not contain images at 'output.choices.0.message.content[].image'."
+        )
+    return _image_payloads_to_tensor(image_payloads, config=config)
+
+
+def generate_dashscope_video(
+    config: RemoteMediaConfig,
+    *,
+    operation: str,
+    prompt: str,
+    model: str,
+    resolution: str = "720P",
+    ratio: str = "16:9",
+    duration: int = 5,
+    negative_prompt: str = "",
+    prompt_extend: bool = True,
+    watermark: bool = False,
+    seed: int = 0,
+    first_frame: Any = None,
+    reference_images: list[Any] | None = None,
+    reference_videos: list[Any] | None = None,
+    edit_video: Any = None,
+    audio_setting: str = "auto",
+) -> tuple[Any, str]:
+    prompt = _normalize_prompt_text(prompt)
+    model = str(model).strip()
+    is_happyhorse = model.startswith("happyhorse-")
+    reference_images = [item for item in (reference_images or []) if item is not None]
+    reference_videos = [item for item in (reference_videos or []) if item is not None]
+    media_debug: list[dict[str, Any]] = []
+    media: list[dict[str, str]] = []
+
+    if operation == "dashscope_image_to_video":
+        if first_frame is None:
+            raise CompanyRemoteAPIError("首帧图生视频必须连接一张首帧图片。")
+        media.append({
+            "type": "first_frame",
+            "url": _image_to_url(first_frame, config, role="first_frame", media_debug=media_debug),
+        })
+    elif operation == "dashscope_reference_to_video":
+        if not reference_images and not reference_videos:
+            raise CompanyRemoteAPIError("参考生视频至少需要一张参考图片或一段参考视频。")
+        if is_happyhorse and reference_videos:
+            raise CompanyRemoteAPIError("HappyHorse 参考生视频仅支持参考图片，不支持参考视频。")
+        if is_happyhorse and len(reference_images) > 9:
+            raise CompanyRemoteAPIError("HappyHorse 参考生视频最多支持 9 张参考图片。")
+        if not is_happyhorse and len(reference_images) + len(reference_videos) > 5:
+            raise CompanyRemoteAPIError("Wan 2.7 参考图片与参考视频合计最多支持 5 个。")
+        media.extend(
+            {
+                "type": "reference_image",
+                "url": _image_to_url(item, config, role=f"reference_image_{index}", media_debug=media_debug),
+            }
+            for index, item in enumerate(reference_images, start=1)
+        )
+        media.extend(
+            {
+                "type": "reference_video",
+                "url": _dashscope_video_url(item, config, role=f"reference_video_{index}", media_debug=media_debug),
+            }
+            for index, item in enumerate(reference_videos, start=1)
+        )
+    elif operation == "dashscope_video_edit":
+        if edit_video is None:
+            raise CompanyRemoteAPIError("视频编辑必须连接一个待编辑视频。")
+        if len(reference_images) > 5:
+            raise CompanyRemoteAPIError("HappyHorse 视频编辑最多支持 5 张参考图片。")
+        media.append({
+            "type": "video",
+            "url": _dashscope_video_url(edit_video, config, role="edit_video", media_debug=media_debug),
+        })
+        media.extend(
+            {
+                "type": "reference_image",
+                "url": _image_to_url(item, config, role=f"reference_image_{index}", media_debug=media_debug),
+            }
+            for index, item in enumerate(reference_images, start=1)
+        )
+
+    parameters: dict[str, Any] = {
+        "resolution": str(resolution).upper(),
+        "watermark": bool(watermark),
+        "seed": int(seed),
+    }
+    if operation != "dashscope_video_edit":
+        duration = int(duration)
+        minimum_duration = 3 if is_happyhorse else 2
+        maximum_duration = 10 if reference_videos and not is_happyhorse else 15
+        if not minimum_duration <= duration <= maximum_duration:
+            raise CompanyRemoteAPIError(
+                f"{model} 当前输入组合的视频时长必须为 {minimum_duration}-{maximum_duration} 秒。"
+            )
+        parameters["duration"] = duration
+    if operation in {"dashscope_text_to_video", "dashscope_reference_to_video"}:
+        parameters["ratio"] = ratio
+    if operation == "dashscope_video_edit":
+        parameters["audio_setting"] = audio_setting
+    elif not is_happyhorse:
+        parameters["prompt_extend"] = bool(prompt_extend)
+
+    input_data: dict[str, Any] = {"prompt": prompt}
+    if media:
+        input_data["media"] = media
+    if negative_prompt.strip() and not is_happyhorse:
+        input_data["negative_prompt"] = negative_prompt.strip()
+    payload = {"model": model, "input": input_data, "parameters": parameters}
+
+    debug_values = {
+        "operation": operation,
+        "model": model,
+        "prompt": prompt,
+        "resolution": resolution,
+        "ratio": ratio,
+        "duration": duration,
+        "watermark": watermark,
+        "seed": seed,
+    }
+    _write_request_debug(config, operation=operation, values=debug_values, payload=payload, media_debug=media_debug)
+    response_data = _submit(config, payload)
+    url = _resolve_result_url(config, response_data, output_type="video")
+    path = _download_file(url, config=config, output_type="video")
+    return InputImpl.VideoFromFile(path), path
+
+
+def _dashscope_video_url(
+    video: Any,
+    config: RemoteMediaConfig,
+    *,
+    role: str,
+    media_debug: list[dict[str, Any]],
+) -> str:
+    url = _video_to_url(video, config, role=role, media_debug=media_debug)
+    if not url.startswith(("http://", "https://", "oss://")):
+        raise CompanyRemoteAPIError(
+            "阿里云百炼的视频输入必须是公网 URL 或 oss:// 临时地址。"
+            "请在 aliyun_dashscope_video 配置中启用 TOS 临时签名 URL。"
+        )
+    return url
 
 
 def generate_video(
@@ -406,6 +624,8 @@ def _build_payload_with_debug(
         if value not in (None, "") and key not in payload:
             payload[key] = value
 
+    videos = _preflight_seedance_reference_videos(config, values=values, videos=videos)
+
     images = images or {}
     single_image = images.get("image")
     if single_image is not None and config.image_field and config.image_field not in payload:
@@ -454,7 +674,6 @@ def _build_payload_with_debug(
             if config.images_field and config.images_field not in payload:
                 payload[config.images_field] = encoded_images
 
-    videos = videos or {}
     reference_video = videos.get("reference_video")
     if reference_video is not None and not _uses_ark_content_generation(config):
         encoded_video = _video_to_url(reference_video, config, role="reference_video", media_debug=media_debug)
@@ -503,6 +722,30 @@ def _build_payload_with_debug(
 
 def _uses_ark_content_generation(config: RemoteMediaConfig) -> bool:
     return "/api/v3/contents/generations/tasks" in (config.submit_path or "") and "ark" in (config.base_url or "")
+
+
+def _preflight_seedance_reference_videos(
+    config: RemoteMediaConfig,
+    *,
+    values: dict[str, Any],
+    videos: dict[str, Any] | None,
+) -> dict[str, Any]:
+    prepared_videos = dict(videos or {})
+    if not (
+        _uses_ark_content_generation(config)
+        and str(values.get("operation", "")) == "seedance2_reference_video"
+    ):
+        return prepared_videos
+
+    reference_videos = [video for video in prepared_videos.get("reference_videos", []) if video is not None]
+    if not reference_videos:
+        return prepared_videos
+
+    prepared_videos["reference_videos"] = [
+        _prepare_seedance_reference_video(video, role=f"reference_video_{index + 1}")
+        for index, video in enumerate(reference_videos)
+    ]
+    return prepared_videos
 
 
 def _append_ark_content_urls(payload: dict[str, Any], content_type: str, urls: list[str], *, role: str) -> None:
@@ -637,6 +880,10 @@ def _openai_image_response_to_tensor(response_data: Any, *, config: RemoteMediaC
     if not image_payloads:
         raise CompanyRemoteAPIError("Response did not contain OpenAI image data at 'data[].b64_json' or 'data[].url'.")
 
+    return _image_payloads_to_tensor(image_payloads, config=config)
+
+
+def _image_payloads_to_tensor(image_payloads: list[str], *, config: RemoteMediaConfig):
     image_tensors = [_image_payload_to_tensor(payload, config=config) for payload in image_payloads]
     ref_h, ref_w = image_tensors[0].shape[:2]
     for i, tensor in enumerate(image_tensors):
@@ -1026,6 +1273,185 @@ def _tos_http_get_method(tos_module: Any) -> Any:
     raise CompanyRemoteAPIError("TOS SDK does not expose a GET pre-signed URL method")
 
 
+def _prepare_seedance_reference_video(video: Any, *, role: str) -> _PreparedVideo:
+    content, mime, extension, source_info = _video_to_bytes(video)
+    source_label = str(source_info.get("basename") or role)
+    original_duration = _probe_video_duration_seconds(content, source_label=source_label)
+
+    source_info.update(
+        {
+            "original_duration_seconds": round(original_duration, 6),
+            "duration_seconds": round(original_duration, 6),
+            "duration_limit_seconds": SEEDANCE_REFERENCE_VIDEO_MAX_SECONDS,
+            "auto_trimmed": False,
+        }
+    )
+    print(
+        f"[company_remote] Seedance reference video preflight: '{source_label}', "
+        f"duration={original_duration:.3f}s, limit={SEEDANCE_REFERENCE_VIDEO_MAX_SECONDS:.3f}s"
+    )
+    if original_duration <= SEEDANCE_REFERENCE_VIDEO_MAX_SECONDS:
+        return _PreparedVideo(content, mime, extension, source_info)
+
+    try:
+        trimmed_content = _trim_video_bytes(
+            content,
+            source_label=source_label,
+            source_extension=extension,
+            target_seconds=SEEDANCE_REFERENCE_VIDEO_TRIM_SECONDS,
+        )
+        trimmed_duration = _probe_video_duration_seconds(trimmed_content, source_label=f"{source_label} (trimmed)")
+    except CompanyRemoteAPIError as exc:
+        raise CompanyRemoteAPIError(
+            f"Seedance 参考视频 '{source_label}' 实际时长 {original_duration:.3f}s，"
+            f"超过接口上限 {SEEDANCE_REFERENCE_VIDEO_MAX_SECONDS:.3f}s；"
+            f"自动裁剪到 {SEEDANCE_REFERENCE_VIDEO_TRIM_SECONDS:.3f}s 失败：{exc}"
+        ) from exc
+
+    if trimmed_duration > SEEDANCE_REFERENCE_VIDEO_MAX_SECONDS:
+        raise CompanyRemoteAPIError(
+            f"Seedance 参考视频 '{source_label}' 自动裁剪后仍为 {trimmed_duration:.3f}s，"
+            f"超过接口上限 {SEEDANCE_REFERENCE_VIDEO_MAX_SECONDS:.3f}s。"
+        )
+
+    source_info.update(
+        {
+            "duration_seconds": round(trimmed_duration, 6),
+            "auto_trimmed": True,
+            "trim_target_seconds": SEEDANCE_REFERENCE_VIDEO_TRIM_SECONDS,
+            "original_bytes": len(content),
+        }
+    )
+    print(
+        f"[company_remote] Seedance reference video auto-trimmed: '{source_label}', "
+        f"{original_duration:.3f}s -> {trimmed_duration:.3f}s "
+        f"({len(content)} -> {len(trimmed_content)} bytes)"
+    )
+    return _PreparedVideo(trimmed_content, "video/mp4", ".mp4", source_info)
+
+
+def _probe_video_duration_seconds(content: bytes, *, source_label: str) -> float:
+    try:
+        import av
+    except ImportError as exc:
+        raise CompanyRemoteAPIError(
+            "无法检测 Seedance 参考视频时长：portable Python 缺少 PyAV（import av）。"
+        ) from exc
+
+    try:
+        with av.open(BytesIO(content)) as container:
+            video_streams = list(container.streams.video)
+            if not video_streams:
+                raise CompanyRemoteAPIError(f"参考视频 '{source_label}' 中没有可用的视频流。")
+
+            duration_candidates: list[float] = []
+            if container.duration is not None:
+                duration_candidates.append(float(container.duration) / float(av.time_base))
+            for stream in video_streams:
+                if stream.duration is not None and stream.time_base is not None:
+                    duration_candidates.append(float(stream.duration * stream.time_base))
+    except CompanyRemoteAPIError:
+        raise
+    except Exception as exc:
+        raise CompanyRemoteAPIError(f"无法读取参考视频 '{source_label}' 的时长：{exc}") from exc
+
+    valid_durations = [value for value in duration_candidates if math.isfinite(value) and value > 0]
+    if not valid_durations:
+        raise CompanyRemoteAPIError(f"无法从参考视频 '{source_label}' 的容器或视频流元数据中取得有效时长。")
+    return max(valid_durations)
+
+
+def _trim_video_bytes(
+    content: bytes,
+    *,
+    source_label: str,
+    source_extension: str,
+    target_seconds: float,
+) -> bytes:
+    try:
+        import imageio_ffmpeg
+    except ImportError as exc:
+        raise CompanyRemoteAPIError(
+            "portable Python 缺少 imageio_ffmpeg，无法自动裁剪超长参考视频。"
+        ) from exc
+
+    try:
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as exc:
+        raise CompanyRemoteAPIError(f"无法定位 portable Python 自带的 ffmpeg.exe：{exc}") from exc
+
+    safe_extension = source_extension if source_extension.startswith(".") and len(source_extension) <= 10 else ".mp4"
+    try:
+        with tempfile.TemporaryDirectory(prefix="company_remote_seedance_trim_") as temp_dir:
+            input_path = os.path.join(temp_dir, f"input{safe_extension}")
+            output_path = os.path.join(temp_dir, "output.mp4")
+            with open(input_path, "wb") as handle:
+                handle.write(content)
+
+            command = [
+                ffmpeg_exe,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                input_path,
+                "-t",
+                f"{target_seconds:.3f}",
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-vf",
+                "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "18",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "160k",
+                "-movflags",
+                "+faststart",
+                output_path,
+            ]
+            creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=600,
+                    check=False,
+                    creationflags=creation_flags,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise CompanyRemoteAPIError(
+                    f"ffmpeg 裁剪参考视频 '{source_label}' 超过 600 秒，已终止。"
+                ) from exc
+
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "unknown ffmpeg error").strip()
+                if len(detail) > 1200:
+                    detail = detail[-1200:]
+                raise CompanyRemoteAPIError(
+                    f"ffmpeg 裁剪参考视频 '{source_label}' 失败（exit={result.returncode}）：{detail}"
+                )
+            if not os.path.isfile(output_path) or os.path.getsize(output_path) <= 0:
+                raise CompanyRemoteAPIError(f"ffmpeg 未生成有效的裁剪视频：'{source_label}'。")
+            with open(output_path, "rb") as handle:
+                return handle.read()
+    except CompanyRemoteAPIError:
+        raise
+    except Exception as exc:
+        raise CompanyRemoteAPIError(f"自动裁剪参考视频 '{source_label}' 时发生错误：{exc}") from exc
+
+
 def _video_to_url(
     video: Any,
     config: RemoteMediaConfig,
@@ -1066,6 +1492,9 @@ def _video_to_url(
 
 
 def _video_to_bytes(video: Any) -> tuple[bytes, str, str, dict[str, Any]]:
+    if isinstance(video, _PreparedVideo):
+        return video.content, video.mime, video.extension, dict(video.source_info)
+
     source = video.get_stream_source() if hasattr(video, "get_stream_source") else video
     if isinstance(source, BytesIO):
         source.seek(0)

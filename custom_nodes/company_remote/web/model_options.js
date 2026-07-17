@@ -3,6 +3,7 @@ import { app } from "../../scripts/app.js";
 const TARGET_NODES = new Set([
   "CompanyPromptEnhancer",
   "CompanyImagePromptEnhancer",
+  "CompanyMultiPersonPromptAnalyzer",
 ]);
 const MODELS_URL = "/api/company_remote/models?config=gpttext";
 

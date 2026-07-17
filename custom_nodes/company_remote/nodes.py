@@ -13,6 +13,8 @@ from comfy_api_nodes.util import downscale_image_tensor, get_number_of_images, v
 
 from .client import (
     DEFAULT_OPENAI_TEXT_MODEL,
+    generate_dashscope_image,
+    generate_dashscope_video,
     generate_image,
     generate_openai_chat_text,
     generate_openai_image,
@@ -21,6 +23,15 @@ from .client import (
     get_cached_openai_model_ids,
 )
 from .config_store import ConfigError, get_config, load_configs
+from .multi_person import (
+    MULTI_PERSON_ANALYZER_SKILL,
+    MULTI_PERSON_REPAIR_SKILL,
+    MultiPersonCountError,
+    MultiPersonFormatError,
+    build_analysis_request,
+    build_repair_request,
+    parse_multi_person_analysis,
+)
 
 
 SEEDREAM_MODEL_OPTIONS = [
@@ -59,6 +70,28 @@ KLING_MODEL_OPTIONS = [
 KLING_MODE_OPTIONS = ["std", "pro"]
 KLING_DURATION_OPTIONS = ["5", "10"]
 KLING_ASPECT_RATIO_OPTIONS = ["16:9", "9:16", "1:1"]
+ALIYUN_QWEN_IMAGE_MODELS = [
+    "qwen-image-2.0-pro-2026-06-22",
+    "qwen-image-2.0-pro-2026-04-22",
+]
+ALIYUN_TEXT_TO_VIDEO_MODELS = [
+    "wan2.7-t2v-2026-06-12",
+    "wan2.7-t2v-2026-04-25",
+    "happyhorse-1.1-t2v",
+    "happyhorse-1.0-t2v",
+]
+ALIYUN_IMAGE_TO_VIDEO_MODELS = [
+    "wan2.7-i2v-2026-04-25",
+    "happyhorse-1.1-i2v",
+    "happyhorse-1.0-i2v",
+]
+ALIYUN_REFERENCE_TO_VIDEO_MODELS = [
+    "wan2.7-r2v-2026-06-12",
+    "happyhorse-1.1-r2v",
+    "happyhorse-1.0-r2v",
+]
+ALIYUN_VIDEO_EDIT_MODELS = ["happyhorse-1.0-video-edit"]
+ALIYUN_VIDEO_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4"]
 
 PROVIDER_ALIASES = {
     "gptimage2": ["gptimage2", "gpt_image2", "gpt-image-2", "gpt image 2", "ai_zero_token"],
@@ -68,6 +101,8 @@ PROVIDER_ALIASES = {
     "kling": ["kling", "kling_image_to_video"],
     "vidu": ["vidu", "viduq3", "vidu_q3"],
     "minimax_hailuo": ["minimax_hailuo", "minimax", "hailuo", "minimax-hailuo"],
+    "aliyun_dashscope_image": ["aliyun_dashscope_image", "dashscope_image", "aliyun_image"],
+    "aliyun_dashscope_video": ["aliyun_dashscope_video", "dashscope_video", "aliyun_video"],
 }
 
 
@@ -422,6 +457,158 @@ class CompanyImagePromptEnhancer(IO.ComfyNode):
             max_tokens=max_tokens,
         )
         return IO.NodeOutput(text, ui={"text": (text,)})
+
+
+class CompanyPersistentPromptDisplay(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyPersistentPromptDisplay",
+            display_name="持久化提示词显示",
+            category="company-remote/text/utilities",
+            description="显示并原样传递 STRING；执行结果随工作流保存并在重新打开时恢复。",
+            search_aliases=["Persistent Prompt Display", "Persistent Text", "保存提示词"],
+            inputs=[
+                IO.String.Input(
+                    "text",
+                    display_name="提示词",
+                    multiline=True,
+                    force_input=True,
+                    tooltip="连接提示词优化节点的 STRING 输出。",
+                ),
+            ],
+            outputs=[IO.String.Output(display_name="提示词")],
+        )
+
+    @classmethod
+    def execute(cls, text: str):
+        value = str(text or "")
+        return IO.NodeOutput(value, ui={"text": (value,)})
+
+
+class CompanyMultiPersonPromptAnalyzer(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyMultiPersonPromptAnalyzer",
+            display_name="多人角色识别与提示词拆分",
+            category="company-remote/text/OpenAI",
+            description="一次识别图片中的 1-3 个主要人物，统一编号并输出人物、背景和合成提示词。",
+            search_aliases=[
+                "Multi Person Prompt Analyzer",
+                "Character A B C Analyzer",
+                "多人识别",
+                "人物 A B C",
+            ],
+            inputs=[
+                IO.String.Input(
+                    "modification_target",
+                    display_name="转换目标",
+                    multiline=True,
+                    default=(
+                        "将输入画面转换为具有真实摄影质感的真人场景。保持每个人物可辨识的发型、"
+                        "服装、配饰、道具和角色气质，允许重新设计自然动作、表情、镜头和环境互动。"
+                    ),
+                    tooltip="说明人物与背景需要完成的整体转换目标。",
+                ),
+                IO.Image.Input(
+                    "image",
+                    display_name="原始图片",
+                    tooltip="必填。一次分析并统一识别人物 A、B、C。",
+                ),
+                _gpt_text_model_input(),
+                IO.Float.Input(
+                    "temperature",
+                    display_name="温度",
+                    default=0.2,
+                    min=0.0,
+                    max=2.0,
+                    step=0.1,
+                    tooltip="人物识别建议使用较低温度。",
+                ),
+                IO.Int.Input(
+                    "max_tokens",
+                    display_name="最大输出 Tokens",
+                    default=3000,
+                    min=512,
+                    max=16384,
+                    step=1,
+                    display_mode=IO.NumberDisplay.number,
+                    tooltip="用于完整输出身份表及全部分支提示词。",
+                ),
+            ],
+            outputs=[
+                IO.Int.Output(display_name="人物数量"),
+                IO.String.Output(display_name="统一身份表"),
+                IO.String.Output(display_name="人物 A 提示词"),
+                IO.String.Output(display_name="人物 B 提示词"),
+                IO.String.Output(display_name="人物 C 提示词"),
+                IO.String.Output(display_name="背景处理提示词"),
+                IO.String.Output(display_name="最终合成提示词"),
+            ],
+            is_api_node=True,
+            is_output_node=True,
+        )
+
+    @classmethod
+    def validate_inputs(cls, model: str):
+        return _validate_gpt_text_model(model)
+
+    @classmethod
+    async def execute(
+        cls,
+        modification_target: str,
+        image: Any,
+        model: str = DEFAULT_OPENAI_TEXT_MODEL,
+        temperature: float = 0.2,
+        max_tokens: int = 3000,
+    ):
+        config = _load_provider_config("gpttext")
+        raw_text = await asyncio.to_thread(
+            generate_openai_image_prompt_text,
+            config,
+            skill=MULTI_PERSON_ANALYZER_SKILL,
+            modification_target=build_analysis_request(modification_target),
+            image=image,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+        try:
+            analysis = parse_multi_person_analysis(raw_text)
+        except MultiPersonCountError:
+            raise
+        except MultiPersonFormatError as first_error:
+            repaired_text = await asyncio.to_thread(
+                generate_openai_chat_text,
+                config,
+                skill=MULTI_PERSON_REPAIR_SKILL,
+                user_prompt=build_repair_request(raw_text, first_error),
+                model=model,
+                temperature=0.0,
+                max_tokens=max_tokens,
+            )
+            try:
+                analysis = parse_multi_person_analysis(repaired_text)
+            except MultiPersonFormatError as second_error:
+                raise ValueError(
+                    f"多人识别返回格式无效，自动修复后仍无法解析：{second_error}"
+                ) from second_error
+
+        outputs = analysis.node_outputs()
+        return IO.NodeOutput(
+            *outputs,
+            ui={
+                "person_count": (analysis.person_count,),
+                "identity_manifest": (analysis.identity_manifest,),
+                "person_a_prompt": (analysis.person_a_prompt,),
+                "person_b_prompt": (analysis.person_b_prompt,),
+                "person_c_prompt": (analysis.person_c_prompt,),
+                "background_prompt": (analysis.background_prompt,),
+                "final_prompt": (analysis.final_prompt,),
+            },
+        )
 
 
 class CompanyGPTImage2(IO.ComfyNode):
@@ -1200,9 +1387,308 @@ class CompanyMiniMaxHailuoVideo(IO.ComfyNode):
         )
 
 
+def _aliyun_video_common_inputs(models: list[str], *, with_ratio: bool = True) -> list[Any]:
+    inputs: list[Any] = [
+        IO.Combo.Input("model", options=models, display_name="模型"),
+        IO.String.Input("prompt", display_name="提示词", multiline=True, default=""),
+        IO.Combo.Input("resolution", options=["720P", "1080P"], default="720P", display_name="分辨率"),
+    ]
+    if with_ratio:
+        inputs.append(IO.Combo.Input("ratio", options=ALIYUN_VIDEO_RATIOS, default="16:9", display_name="画幅比例"))
+    inputs.extend([
+        IO.Int.Input(
+            "duration",
+            display_name="时长（秒）",
+            default=5,
+            min=2,
+            max=15,
+            step=1,
+            display_mode=IO.NumberDisplay.slider,
+        ),
+        IO.String.Input(
+            "negative_prompt",
+            display_name="负面提示词",
+            multiline=True,
+            default="",
+            optional=True,
+            advanced=True,
+        ),
+        IO.Boolean.Input("prompt_extend", display_name="智能改写", default=True, advanced=True),
+        IO.Boolean.Input("watermark", display_name="水印", default=False, advanced=True),
+        IO.Int.Input(
+            "seed",
+            display_name="种子",
+            default=0,
+            min=0,
+            max=2147483647,
+            step=1,
+            display_mode=IO.NumberDisplay.number,
+            control_after_generate=True,
+        ),
+    ])
+    return inputs
+
+
+class CompanyAliyunQwenImage(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyAliyunQwenImage",
+            display_name="阿里云 Qwen Image 2.0 生成 / 编辑",
+            category="company-remote/image/Alibaba Cloud",
+            description="调用阿里云百炼 Qwen Image 2.0 Pro。未连接参考图时文生图，连接后图像编辑。",
+            search_aliases=["Alibaba Cloud Qwen Image", "DashScope Qwen Image"],
+            inputs=[
+                IO.String.Input("prompt", display_name="提示词", multiline=True, default=""),
+                IO.Combo.Input("model", options=ALIYUN_QWEN_IMAGE_MODELS, display_name="模型"),
+                IO.Autogrow.Input(
+                    "reference_images",
+                    display_name="参考图片（可选）",
+                    template=IO.Autogrow.TemplateNames(
+                        IO.Image.Input("reference_image", display_name="参考图片"),
+                        names=[f"image_{index}" for index in range(1, 4)],
+                        min=0,
+                    ),
+                ),
+                IO.Combo.Input(
+                    "size",
+                    options=["2048x2048", "2688x1536", "1536x2688", "2368x1728", "1728x2368"],
+                    default="2048x2048",
+                    display_name="尺寸",
+                ),
+                IO.String.Input(
+                    "negative_prompt",
+                    display_name="负面提示词",
+                    multiline=True,
+                    default="",
+                    optional=True,
+                ),
+                IO.Int.Input("n", display_name="图片数量", default=1, min=1, max=6, step=1),
+                IO.Boolean.Input("prompt_extend", display_name="智能改写", default=True),
+                IO.Boolean.Input("watermark", display_name="水印", default=False, advanced=True),
+                IO.Int.Input(
+                    "seed",
+                    display_name="种子",
+                    default=0,
+                    min=0,
+                    max=2147483647,
+                    step=1,
+                    display_mode=IO.NumberDisplay.number,
+                    control_after_generate=True,
+                ),
+            ],
+            outputs=[IO.Image.Output(display_name="图片")],
+            is_api_node=True,
+        )
+
+    @classmethod
+    async def execute(
+        cls,
+        prompt: str,
+        model: str,
+        size: str,
+        negative_prompt: str = "",
+        n: int = 1,
+        prompt_extend: bool = True,
+        watermark: bool = False,
+        seed: int = 0,
+        reference_images: Any = None,
+    ):
+        image = await asyncio.to_thread(
+            generate_dashscope_image,
+            _load_provider_config("aliyun_dashscope_image"),
+            prompt=prompt,
+            model=model,
+            size=size,
+            negative_prompt=negative_prompt,
+            n=n,
+            prompt_extend=prompt_extend,
+            watermark=watermark,
+            seed=seed,
+            reference_images=_dict_values(reference_images),
+        )
+        return IO.NodeOutput(image)
+
+
+class CompanyAliyunTextToVideo(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyAliyunTextToVideo",
+            display_name="阿里云 Wan / HappyHorse 文生视频",
+            category="company-remote/video/Alibaba Cloud",
+            description="调用阿里云百炼 Wan 2.7 或 HappyHorse 文生视频接口。",
+            inputs=_aliyun_video_common_inputs(ALIYUN_TEXT_TO_VIDEO_MODELS),
+            outputs=[IO.Video.Output(display_name="视频"), IO.String.Output(display_name="视频路径")],
+            is_api_node=True,
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, model: str, prompt: str, resolution: str, ratio: str, duration: int,
+                negative_prompt: str = "", prompt_extend: bool = True, watermark: bool = False, seed: int = 0):
+        return generate_dashscope_video(
+            _load_provider_config("aliyun_dashscope_video"),
+            operation="dashscope_text_to_video",
+            model=model,
+            prompt=prompt,
+            resolution=resolution,
+            ratio=ratio,
+            duration=duration,
+            negative_prompt=negative_prompt,
+            prompt_extend=prompt_extend,
+            watermark=watermark,
+            seed=seed,
+        )
+
+
+class CompanyAliyunImageToVideo(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyAliyunImageToVideo",
+            display_name="阿里云 Wan / HappyHorse 首帧图生视频",
+            category="company-remote/video/Alibaba Cloud",
+            description="调用阿里云百炼 Wan 2.7 或 HappyHorse 首帧图生视频接口。",
+            inputs=[
+                IO.Image.Input("first_frame", display_name="首帧图片"),
+                *_aliyun_video_common_inputs(ALIYUN_IMAGE_TO_VIDEO_MODELS, with_ratio=False),
+            ],
+            outputs=[IO.Video.Output(display_name="视频"), IO.String.Output(display_name="视频路径")],
+            is_api_node=True,
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, first_frame: Any, model: str, prompt: str, resolution: str, duration: int,
+                negative_prompt: str = "", prompt_extend: bool = True, watermark: bool = False, seed: int = 0):
+        return generate_dashscope_video(
+            _load_provider_config("aliyun_dashscope_video"),
+            operation="dashscope_image_to_video",
+            model=model,
+            prompt=prompt,
+            resolution=resolution,
+            duration=duration,
+            negative_prompt=negative_prompt,
+            prompt_extend=prompt_extend,
+            watermark=watermark,
+            seed=seed,
+            first_frame=first_frame,
+        )
+
+
+class CompanyAliyunReferenceToVideo(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyAliyunReferenceToVideo",
+            display_name="阿里云 Wan / HappyHorse 参考生视频",
+            category="company-remote/video/Alibaba Cloud",
+            description="Wan 2.7 支持参考图片和视频；HappyHorse 仅支持参考图片。",
+            inputs=[
+                *_aliyun_video_common_inputs(ALIYUN_REFERENCE_TO_VIDEO_MODELS),
+                IO.Autogrow.Input(
+                    "reference_images",
+                    display_name="参考图片",
+                    template=IO.Autogrow.TemplateNames(
+                        IO.Image.Input("reference_image", display_name="参考图片"),
+                        names=[f"image_{index}" for index in range(1, 10)],
+                        min=0,
+                    ),
+                ),
+                IO.Autogrow.Input(
+                    "reference_videos",
+                    display_name="参考视频（仅 Wan）",
+                    template=IO.Autogrow.TemplateNames(
+                        IO.Video.Input("reference_video", display_name="参考视频"),
+                        names=[f"video_{index}" for index in range(1, 6)],
+                        min=0,
+                    ),
+                ),
+            ],
+            outputs=[IO.Video.Output(display_name="视频"), IO.String.Output(display_name="视频路径")],
+            is_api_node=True,
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, model: str, prompt: str, resolution: str, ratio: str, duration: int,
+                negative_prompt: str = "", prompt_extend: bool = True, watermark: bool = False,
+                seed: int = 0, reference_images: Any = None, reference_videos: Any = None):
+        return generate_dashscope_video(
+            _load_provider_config("aliyun_dashscope_video"),
+            operation="dashscope_reference_to_video",
+            model=model,
+            prompt=prompt,
+            resolution=resolution,
+            ratio=ratio,
+            duration=duration,
+            negative_prompt=negative_prompt,
+            prompt_extend=prompt_extend,
+            watermark=watermark,
+            seed=seed,
+            reference_images=_dict_values(reference_images),
+            reference_videos=_dict_values(reference_videos),
+        )
+
+
+class CompanyAliyunVideoEdit(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyAliyunVideoEdit",
+            display_name="阿里云 HappyHorse 视频编辑",
+            category="company-remote/video/Alibaba Cloud",
+            description="调用阿里云百炼 HappyHorse 视频编辑接口。",
+            inputs=[
+                IO.Video.Input("video", display_name="待编辑视频"),
+                IO.String.Input("prompt", display_name="编辑指令", multiline=True, default=""),
+                IO.Combo.Input("model", options=ALIYUN_VIDEO_EDIT_MODELS, display_name="模型"),
+                IO.Combo.Input("resolution", options=["720P", "1080P"], default="720P", display_name="分辨率"),
+                IO.Autogrow.Input(
+                    "reference_images",
+                    display_name="参考图片",
+                    template=IO.Autogrow.TemplateNames(
+                        IO.Image.Input("reference_image", display_name="参考图片"),
+                        names=[f"image_{index}" for index in range(1, 6)],
+                        min=0,
+                    ),
+                ),
+                IO.Combo.Input("audio_setting", options=["auto", "origin"], default="auto", display_name="声音"),
+                IO.Boolean.Input("watermark", display_name="水印", default=False, advanced=True),
+                IO.Int.Input(
+                    "seed", display_name="种子", default=0, min=0, max=2147483647, step=1,
+                    display_mode=IO.NumberDisplay.number, control_after_generate=True,
+                ),
+            ],
+            outputs=[IO.Video.Output(display_name="视频"), IO.String.Output(display_name="视频路径")],
+            is_api_node=True,
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, video: Any, prompt: str, model: str, resolution: str,
+                reference_images: Any = None, audio_setting: str = "auto",
+                watermark: bool = False, seed: int = 0):
+        return generate_dashscope_video(
+            _load_provider_config("aliyun_dashscope_video"),
+            operation="dashscope_video_edit",
+            model=model,
+            prompt=prompt,
+            resolution=resolution,
+            watermark=watermark,
+            seed=seed,
+            edit_video=video,
+            reference_images=_dict_values(reference_images),
+            audio_setting=audio_setting,
+        )
+
+
 NODE_CLASS_MAPPINGS = {
     "CompanyPromptEnhancer": CompanyPromptEnhancer,
     "CompanyImagePromptEnhancer": CompanyImagePromptEnhancer,
+    "CompanyPersistentPromptDisplay": CompanyPersistentPromptDisplay,
+    "CompanyMultiPersonPromptAnalyzer": CompanyMultiPersonPromptAnalyzer,
     "CompanyGPTImage2": CompanyGPTImage2,
     "CompanySeedreamImage": CompanySeedreamImage,
     "CompanySeedance2TextToVideo": CompanySeedance2TextToVideo,
@@ -1211,11 +1697,18 @@ NODE_CLASS_MAPPINGS = {
     "CompanyKlingImageToVideo": CompanyKlingImageToVideo,
     "CompanyViduImageToVideo": CompanyViduImageToVideo,
     "CompanyMiniMaxHailuoVideo": CompanyMiniMaxHailuoVideo,
+    "CompanyAliyunQwenImage": CompanyAliyunQwenImage,
+    "CompanyAliyunTextToVideo": CompanyAliyunTextToVideo,
+    "CompanyAliyunImageToVideo": CompanyAliyunImageToVideo,
+    "CompanyAliyunReferenceToVideo": CompanyAliyunReferenceToVideo,
+    "CompanyAliyunVideoEdit": CompanyAliyunVideoEdit,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "CompanyPromptEnhancer": "公司提示词优化",
     "CompanyImagePromptEnhancer": "图片提示词优化节点",
+    "CompanyPersistentPromptDisplay": "持久化提示词显示",
+    "CompanyMultiPersonPromptAnalyzer": "多人角色识别与提示词拆分",
     "CompanyGPTImage2": "公司 GPT Image 2 图片生成",
     "CompanySeedreamImage": "公司 Seedream 图片生成 / 编辑",
     "CompanySeedance2TextToVideo": "公司 Seedance 2.0 文生视频",
@@ -1224,4 +1717,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CompanyKlingImageToVideo": "公司 Kling 图生视频",
     "CompanyViduImageToVideo": "公司 Vidu Q3 图生视频",
     "CompanyMiniMaxHailuoVideo": "公司 MiniMax / Hailuo 视频",
+    "CompanyAliyunQwenImage": "阿里云 Qwen Image 2.0 生成 / 编辑",
+    "CompanyAliyunTextToVideo": "阿里云 Wan / HappyHorse 文生视频",
+    "CompanyAliyunImageToVideo": "阿里云 Wan / HappyHorse 首帧图生视频",
+    "CompanyAliyunReferenceToVideo": "阿里云 Wan / HappyHorse 参考生视频",
+    "CompanyAliyunVideoEdit": "阿里云 HappyHorse 视频编辑",
 }
