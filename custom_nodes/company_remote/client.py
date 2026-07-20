@@ -361,8 +361,15 @@ def generate_dashscope_video(
         minimum_duration = 3 if is_happyhorse else 2
         maximum_duration = 10 if reference_videos and not is_happyhorse else 15
         if not minimum_duration <= duration <= maximum_duration:
+            if reference_videos and not is_happyhorse:
+                raise CompanyRemoteAPIError(
+                    f"{model} 已连接参考视频时，节点的生成视频目标时长必须为 "
+                    f"{minimum_duration}-{maximum_duration} 秒；当前设置为 {duration} 秒。"
+                    "这里检查的是节点的“时长（秒）”参数，不是参考视频文件本身的时长。"
+                )
             raise CompanyRemoteAPIError(
-                f"{model} 当前输入组合的视频时长必须为 {minimum_duration}-{maximum_duration} 秒。"
+                f"{model} 的生成视频目标时长必须为 {minimum_duration}-{maximum_duration} 秒；"
+                f"当前设置为 {duration} 秒。请调整节点的“时长（秒）”参数。"
             )
         parameters["duration"] = duration
     if operation in {"dashscope_text_to_video", "dashscope_reference_to_video"}:
