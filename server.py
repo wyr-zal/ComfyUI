@@ -1119,7 +1119,9 @@ class PromptServer():
                 to_delete = json_data['delete']
                 for id_to_delete in to_delete:
                     delete_func = lambda a: a[1] == id_to_delete
-                    self.prompt_queue.delete_queue_item(delete_func)
+                    deleted = self.prompt_queue.delete_queue_item(delete_func)
+                    if not deleted:
+                        self.prompt_queue.delete_history_item(id_to_delete)
 
             return web.Response(status=200)
 
@@ -1148,6 +1150,7 @@ class PromptServer():
                     nodes.interrupt_processing()
                 else:
                     logging.info(f"Prompt {prompt_id} is not currently running, skipping interrupt")
+                    self.prompt_queue.delete_history_item(prompt_id)
             else:
                 # No prompt_id provided, do a global interrupt
                 logging.info("Global interrupt (no prompt_id specified)")

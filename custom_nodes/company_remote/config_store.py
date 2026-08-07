@@ -203,6 +203,62 @@ def get_config(name: str) -> RemoteMediaConfig:
     raise ConfigError(f"company remote config not found: {normalized}")
 
 
+def get_gpt_image_provider_config(provider: str) -> RemoteMediaConfig:
+    normalized = str(provider or "WisArt").strip().lower()
+    configs = _load_config_objects()
+    by_name = {cfg.name.lower(): cfg for cfg in configs}
+
+    if normalized in {"wisart", "wis art"}:
+        for name in ("gptimage2_wisart", "gptimage2"):
+            if name in by_name:
+                return by_name[name]
+        raise ConfigError("未找到 WisArt 图片配置 gptimage2。")
+
+    if normalized not in {"ai-zero-token", "ai zero token", "ai_zero_token"}:
+        raise ConfigError(f"不支持的 GPT Image 2 图片服务：{provider}。")
+
+    for name in ("gptimage2_ai_zero_token", "ai_zero_token_image"):
+        if name in by_name:
+            return by_name[name]
+
+    text_config = next(
+        (
+            by_name[name]
+            for name in ("gpttext", "gpt_text", "gpt-text", "ai_zero_token_text")
+            if name in by_name
+        ),
+        None,
+    )
+    if text_config is None:
+        raise ConfigError("未找到 AI-Zero-Token 本地配置 gpttext。")
+
+    config_data = text_config.to_dict(include_secret=True)
+    config_data.update(
+        {
+            "name": "gptimage2_ai_zero_token",
+            "submit_path": "/images/generations",
+            "method": "POST",
+            "poll_enabled": False,
+            "test_path": "/models",
+            "request_template": {
+                "model": "{model}",
+                "prompt": "{prompt}",
+                "size": "{size}",
+                "quality": "{quality}",
+                "background": "{background}",
+                "n": "{n}",
+                "response_format": "{response_format}",
+                "moderation": "{moderation}",
+            },
+            "response_image_url_path": "data.0.b64_json",
+            "response_result_url_path": "",
+            "response_task_id_path": "task_id",
+            "response_status_path": "status",
+        }
+    )
+    return RemoteMediaConfig.from_dict(config_data)
+
+
 def upsert_config(data: dict[str, Any], original_name: str | None = None) -> dict[str, Any]:
     configs = _load_config_objects()
     target = _normalize_name(original_name) if original_name else _normalize_name(str(data.get("name") or ""))

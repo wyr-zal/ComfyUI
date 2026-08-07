@@ -1,0 +1,1 @@
+scenedetect>=0.7,<0.8

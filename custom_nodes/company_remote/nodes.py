@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import json
+import time
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 from PIL import Image
 
-from comfy_api.latest import IO
+import folder_paths
+from comfy_api.latest import IO, UI
 from comfy_api_nodes.util import downscale_image_tensor, get_number_of_images, validate_string
 
 from .client import (
@@ -22,7 +27,7 @@ from .client import (
     generate_video,
     get_cached_openai_model_ids,
 )
-from .config_store import ConfigError, get_config, load_configs
+from .config_store import ConfigError, get_config, get_gpt_image_provider_config, load_configs
 from .multi_person import (
     MULTI_PERSON_ANALYZER_SKILL,
     MULTI_PERSON_REPAIR_SKILL,
@@ -32,6 +37,44 @@ from .multi_person import (
     build_repair_request,
     parse_multi_person_analysis,
 )
+from .long_video import (
+    AUTO_ASSET_STYLE_WESTERN,
+    AUTO_ASSET_STYLE_ANIME,
+    AUTO_ASSET_STYLE_CG_3D,
+    AUTO_ASSET_STYLE_COMIC,
+    AUTO_ASSET_STYLE_CUSTOM,
+    AUTO_ASSET_STYLE_PHOTOREAL,
+    BACKGROUND_IDS,
+    PERSON_IDS,
+    asset_image_inputs,
+    analyze_long_video_job,
+    analyze_asset_mapping,
+    collect_long_video_results,
+    connected_asset_dict,
+    create_asset_manifest,
+    detect_long_video_shots,
+    generate_long_video_segments_parallel,
+    build_long_video_auto_assets,
+    generate_long_video_segments,
+    inspect_long_video_shots,
+    load_long_video_assets,
+    match_long_video_references,
+    merge_long_video_job,
+    plan_long_video_job,
+    process_long_video,
+    pack_long_video_auto_references,
+    plan_long_video_auto_asset_job,
+    MANUAL_BATCH_PROCESSING_CONTRACT_VERSION,
+    MANUAL_BATCH_CONTRACT,
+    select_manual_batch_range,
+    select_continuous_shot_range,
+    select_long_video_length_range,
+)
+
+
+LongVideoAssetsType = IO.Custom("长视频资产清单")
+LongVideoShotPlanType = IO.Custom("长视频镜头计划")
+LongVideoJobType = IO.Custom("长视频分段任务")
 
 
 SEEDREAM_MODEL_OPTIONS = [
@@ -90,7 +133,7 @@ ALIYUN_REFERENCE_TO_VIDEO_MODELS = [
     "happyhorse-1.1-r2v",
     "happyhorse-1.0-r2v",
 ]
-ALIYUN_VIDEO_EDIT_MODELS = ["happyhorse-1.0-video-edit"]
+ALIYUN_VIDEO_EDIT_MODELS = ["wan2.7-videoedit", "happyhorse-1.0-video-edit"]
 ALIYUN_VIDEO_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4"]
 
 PROVIDER_ALIASES = {
@@ -104,6 +147,10 @@ PROVIDER_ALIASES = {
     "aliyun_dashscope_image": ["aliyun_dashscope_image", "dashscope_image", "aliyun_image"],
     "aliyun_dashscope_video": ["aliyun_dashscope_video", "dashscope_video", "aliyun_video"],
 }
+
+GPT_IMAGE_PROVIDER_WISART = "WisArt"
+GPT_IMAGE_PROVIDER_AI_ZERO_TOKEN = "AI-Zero-Token"
+GPT_IMAGE_PROVIDER_OPTIONS = [GPT_IMAGE_PROVIDER_WISART, GPT_IMAGE_PROVIDER_AI_ZERO_TOKEN]
 
 
 def _available_config_names() -> list[str]:
@@ -284,14 +331,14 @@ def _gpt_image_legacy_model_inputs():
     ]
 
 
-def _gpt_text_model_input():
+def _gpt_text_model_input(input_name: str = "model", *, display_name: str = "模型"):
     models = get_cached_openai_model_ids()
     default = DEFAULT_OPENAI_TEXT_MODEL if DEFAULT_OPENAI_TEXT_MODEL in models else models[0]
     return IO.Combo.Input(
-        "model",
+        input_name,
         options=models,
         default=default,
-        display_name="模型",
+        display_name=display_name,
         tooltip="从 AI-Zero-Token /v1/models 动态加载；连接失败时使用最后一次成功缓存。",
     )
 
@@ -478,12 +525,45 @@ class CompanyPersistentPromptDisplay(IO.ComfyNode):
                 ),
             ],
             outputs=[IO.String.Output(display_name="提示词")],
+            is_output_node=True,
         )
 
     @classmethod
     def execute(cls, text: str):
         value = str(text or "")
         return IO.NodeOutput(value, ui={"text": (value,)})
+
+
+class CompanyFixedColumnImagePreview(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyFixedColumnImagePreview",
+            display_name="固定列数图片预览",
+            category="company-remote/image/utilities",
+            description="在节点内按固定列数铺满宽度显示图片，图片较多时使用纵向滚动。",
+            inputs=[
+                IO.Image.Input("images", display_name="图像"),
+                IO.Combo.Input("columns", options=["2", "3"], default="3", display_name="每行图片数量"),
+                IO.Int.Input("gap", display_name="图片间距", default=8, min=0, max=64, step=1),
+            ],
+            outputs=[IO.Image.Output("images", display_name="原始图片")],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, images: torch.Tensor, columns: str, gap: int = 8):
+        if not isinstance(images, torch.Tensor) or images.ndim != 4 or images.shape[0] < 1:
+            raise ValueError("固定列数预览需要至少一张 IMAGE。")
+        preview = UI.PreviewImage(images, cls=cls)
+        return IO.NodeOutput(
+            images,
+            ui={
+                "fixed_grid_images": preview.values,
+                "fixed_grid_columns": (int(columns),),
+                "fixed_grid_gap": (int(gap),),
+            },
+        )
 
 
 class CompanyMultiPersonPromptAnalyzer(IO.ComfyNode):
@@ -611,6 +691,1437 @@ class CompanyMultiPersonPromptAnalyzer(IO.ComfyNode):
         )
 
 
+class CompanyLongVideoAssetManifest(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyLongVideoAssetManifest",
+            display_name="长视频欧美化资产清单",
+            category="company-remote/video/long video",
+            description="保存已确认的人物与背景欧美化参考图，并生成可供长视频批处理复用的 manifest。",
+            search_aliases=["Long Video Asset Manifest", "长视频参考素材", "人物背景资产清单"],
+            inputs=[
+                IO.String.Input("asset_name", display_name="资产名称", default="long_video_assets"),
+                IO.String.Input(
+                    "mapping_json",
+                    display_name="人物/背景映射 JSON",
+                    multiline=True,
+                    default=(
+                        '{\n'
+                        '  "people": {"A": {"source": "原人物 A", "identity": ""}},\n'
+                        '  "backgrounds": {"BG01": {"source": "原背景 BG01", "description": ""}},\n'
+                        '  "mapping": "原人物 A -> 欧美化人物 A"\n'
+                        '}'
+                    ),
+                    tooltip="可由 AI 生成后人工修正；只保存说明和映射，不保存原始输入媒体。",
+                ),
+                *asset_image_inputs(),
+            ],
+            outputs=[
+                IO.String.Output(display_name="资产清单 JSON"),
+                IO.String.Output(display_name="manifest 路径"),
+            ],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, asset_name: str, mapping_json: str, **kwargs):
+        people = connected_asset_dict(kwargs, "person_", PERSON_IDS)
+        backgrounds = connected_asset_dict(kwargs, "", BACKGROUND_IDS)
+        manifest, path = create_asset_manifest(
+            asset_name=asset_name,
+            mapping_json=mapping_json,
+            people=people,
+            backgrounds=backgrounds,
+        )
+        return IO.NodeOutput(manifest, path, ui={"text": (manifest,), "path": (path,)})
+
+
+class CompanyLongVideoMappingAnalyzer(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyLongVideoMappingAnalyzer",
+            display_name="长视频人物与背景映射分析",
+            category="company-remote/video/long video",
+            description="分析已确认的欧美化人物 A/B/C 和背景 BG01-BG08，生成可人工修改的完整资产映射 JSON。",
+            search_aliases=["Long Video Asset Mapping", "人物背景映射确认"],
+            inputs=[
+                IO.Image.Input("person_A", display_name="欧美化人物 A"),
+                IO.Image.Input("person_B", display_name="欧美化人物 B", optional=True),
+                IO.Image.Input("person_C", display_name="欧美化人物 C", optional=True),
+                *[IO.Image.Input(background_id, display_name=f"欧美化背景 {background_id}", optional=True) for background_id in BACKGROUND_IDS],
+                _gpt_text_model_input("analysis_model", display_name="分析模型"),
+            ],
+            outputs=[IO.String.Output(display_name="人物与背景映射 JSON")],
+            is_api_node=True,
+            is_output_node=True,
+        )
+
+    @classmethod
+    def validate_inputs(cls, analysis_model: str):
+        return _validate_gpt_text_model(analysis_model)
+
+    @classmethod
+    async def execute(
+        cls,
+        person_A: Any,
+        person_B: Any = None,
+        person_C: Any = None,
+        analysis_model: str = DEFAULT_OPENAI_TEXT_MODEL,
+        **kwargs,
+    ):
+        mapping = await asyncio.to_thread(
+            analyze_asset_mapping,
+            people={"A": person_A, "B": person_B, "C": person_C},
+            backgrounds=connected_asset_dict(kwargs, "", BACKGROUND_IDS),
+            model=analysis_model,
+        )
+        return IO.NodeOutput(mapping, ui={"text": (mapping,)})
+
+
+def _normalize_long_video_engine_model(engine: str, model: str) -> tuple[str, str]:
+    normalized_engine = "wan" if str(engine).lower().startswith("wan") else "seedance"
+    normalized_model = str(model).strip()
+    if normalized_engine == "wan":
+        normalized_model = "wan2.7-r2v-2026-06-12"
+    elif not normalized_model.lower().startswith("seedance"):
+        normalized_model = "Seedance 2.0 Fast"
+    return normalized_engine, normalized_model
+
+
+class CompanyLongVideoAssetLoader(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyLongVideoAssetLoader",
+            display_name="读取长视频资产清单",
+            category="company-remote/video/long video/stages",
+            description="读取并校验第一阶段保存的人物、背景资产清单。",
+            inputs=[
+                IO.String.Input(
+                    "assets_manifest",
+                    display_name="资产清单 JSON 或路径",
+                    multiline=True,
+                    default="",
+                ),
+                *asset_image_inputs(),
+            ],
+            outputs=[
+                LongVideoAssetsType.Output("assets", display_name="已加载资产"),
+                IO.String.Output("summary", display_name="资产摘要 JSON"),
+            ],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, assets_manifest: str, **kwargs):
+        assets, summary = load_long_video_assets(
+            assets_manifest,
+            people=connected_asset_dict(kwargs, "person_", PERSON_IDS),
+            backgrounds=connected_asset_dict(kwargs, "", BACKGROUND_IDS),
+        )
+        return IO.NodeOutput(assets, summary, ui={"text": (summary,)})
+
+
+class CompanyLongVideoShotDetector(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyLongVideoShotDetector",
+            display_name="长视频镜头检测",
+            category="company-remote/video/long video/stages",
+            description="识别硬切和淡入淡出，输出逻辑镜头、检测记录及镜头起始帧预览。",
+            inputs=[
+                IO.Video.Input("video", display_name="长视频"),
+                IO.Combo.Input(
+                    "mode",
+                    options=["镜头优先（推荐）", "固定时长"],
+                    default="镜头优先（推荐）",
+                    display_name="切分模式",
+                ),
+                IO.Combo.Input("fixed_duration", options=["10", "15"], default="10", display_name="固定分段时长（秒）"),
+                IO.Combo.Input("sensitivity", options=["低", "标准", "高"], default="标准", display_name="镜头检测灵敏度"),
+                IO.Boolean.Input("use_audio_silence", display_name="用音频停顿辅助长镜头切分", default=True),
+                IO.Boolean.Input("auto_fallback", display_name="检测失败自动改用固定切分", default=True),
+            ],
+            outputs=[
+                LongVideoShotPlanType.Output("shot_plan", display_name="镜头计划"),
+                IO.String.Output("shots_json", display_name="镜头检测 JSON"),
+                IO.Image.Output("previews", display_name="镜头起始帧预览"),
+            ],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        video: Any,
+        mode: str,
+        fixed_duration: str,
+        sensitivity: str,
+        use_audio_silence: bool = True,
+        auto_fallback: bool = True,
+    ):
+        plan, status, previews = detect_long_video_shots(
+            video=video,
+            mode=mode,
+            fixed_duration=int(fixed_duration),
+            sensitivity=sensitivity,
+            use_audio_silence=bool(use_audio_silence),
+            auto_fallback=bool(auto_fallback),
+        )
+        return IO.NodeOutput(plan, status, previews, ui={"text": (status,)})
+
+
+class CompanyLongVideoShotInspector(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyLongVideoShotInspector",
+            display_name="分镜检测结果检查",
+            category="company-remote/video/long video/testing",
+            description="选择并播放一个逻辑镜头，同时显示首中尾帧和所有切点前后帧；只做本地检查，不调用远端模型。",
+            inputs=[
+                LongVideoShotPlanType.Input("shot_plan", display_name="镜头计划"),
+                IO.Int.Input("shot_index", display_name="要检查的镜头序号", default=1, min=1, max=9999, step=1),
+                IO.Boolean.Input("export_all_shots", display_name="导出全部检测镜头", default=False),
+            ],
+            outputs=[
+                IO.Video.Output("selected_video", display_name="选中镜头视频"),
+                IO.Image.Output("selected_frames", display_name="选中镜头首中尾帧"),
+                IO.Image.Output("boundary_frames", display_name="切点前后帧对比"),
+                IO.String.Output("report_json", display_name="分镜检查报告 JSON"),
+                IO.String.Output("export_directory", display_name="全部镜头导出目录"),
+            ],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, shot_plan: Any, shot_index: int, export_all_shots: bool = False):
+        selected_video, selected_frames, boundary_frames, report, export_directory = inspect_long_video_shots(
+            shot_plan,
+            shot_index=int(shot_index),
+            export_all_shots=bool(export_all_shots),
+        )
+        subfolder = "company_remote_shot_tests"
+        preview_directory = Path(folder_paths.get_temp_directory()) / subfolder
+        preview_directory.mkdir(parents=True, exist_ok=True)
+        filename = f"shot_preview_{int(shot_index):04d}_{time.time_ns()}.mp4"
+        selected_video.save_to(str(preview_directory / filename))
+        preview = UI.PreviewVideo([UI.SavedResult(filename, subfolder, IO.FolderType.temp)])
+        return IO.NodeOutput(
+            selected_video,
+            selected_frames,
+            boundary_frames,
+            report,
+            export_directory,
+            ui=preview,
+        )
+
+
+class CompanyLongVideoContinuityRangeSelector(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyLongVideoContinuityRangeSelector",
+            display_name="连续分镜范围选择",
+            category="company-remote/video/long video/testing",
+            description="从检测结果中选择任意数量的连续镜头，重置时间轴后交给后续视频生成链路；不保存完整范围预览，避免长视频内存峰值。",
+            inputs=[
+                LongVideoShotPlanType.Input("shot_plan", display_name="镜头计划"),
+                IO.Int.Input("start_shot", display_name="起始镜头序号", default=1, min=1, max=9999, step=1),
+                IO.Int.Input("shot_count", display_name="连续镜头数量（0=全部剩余）", default=0, min=0, step=1),
+            ],
+            outputs=[
+                LongVideoShotPlanType.Output("shot_plan", display_name="选中范围镜头计划"),
+                IO.Video.Output("selected_video", display_name="选中范围原视频"),
+                IO.String.Output("report_json", display_name="范围选择报告 JSON"),
+            ],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, shot_plan: Any, start_shot: int, shot_count: int):
+        selected_plan, selected_video, report = select_continuous_shot_range(
+            shot_plan,
+            start_shot=int(start_shot),
+            shot_count=int(shot_count),
+        )
+        return IO.NodeOutput(selected_plan, selected_video, report, ui={"text": (report,)})
+
+
+class CompanyLongVideoLengthRangeSelector(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyLongVideoLengthRangeSelector",
+            display_name="按时长/百分比选择生成范围",
+            category="company-remote/video/long video/testing",
+            description="按全部剩余、分钟、总长百分比或镜头数量选择连续镜头范围；目标落在镜头中间时保留完整镜头。",
+            inputs=[
+                LongVideoShotPlanType.Input("shot_plan", display_name="镜头计划"),
+                IO.Int.Input("start_shot", display_name="起始镜头序号", default=1, min=1, max=9999, step=1),
+                IO.Combo.Input(
+                    "limit_mode",
+                    options=["全部剩余", "按分钟", "按总长百分比", "按镜头数量"],
+                    default="按分钟",
+                    display_name="生成范围控制方式",
+                ),
+                IO.Float.Input("limit_minutes", display_name="生成时长（分钟，0=全部剩余）", default=3.0, min=0.0, max=9999.0, step=0.1),
+                IO.Float.Input("limit_percent", display_name="占原视频总长百分比（0=全部剩余）", default=30.0, min=0.0, max=100.0, step=1.0),
+                IO.Int.Input("shot_count", display_name="镜头数量（0=全部剩余）", default=0, min=0, step=1),
+            ],
+            outputs=[
+                LongVideoShotPlanType.Output("shot_plan", display_name="选中范围镜头计划"),
+                IO.Video.Output("selected_video", display_name="选中范围原视频"),
+                IO.String.Output("report_json", display_name="范围选择报告 JSON"),
+            ],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        shot_plan: Any,
+        start_shot: int,
+        limit_mode: str,
+        limit_minutes: float,
+        limit_percent: float,
+        shot_count: int,
+    ):
+        selected_plan, selected_video, report = select_long_video_length_range(
+            shot_plan,
+            start_shot=int(start_shot),
+            limit_mode=str(limit_mode),
+            limit_minutes=float(limit_minutes),
+            limit_percent=float(limit_percent),
+            shot_count=int(shot_count),
+        )
+        return IO.NodeOutput(selected_plan, selected_video, report, ui={"text": (report,)})
+
+
+class CompanyLongVideoManualBatchRangeSelector(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyLongVideoManualBatchRangeSelector",
+            display_name="手动批次范围与续接控制",
+            category="company-remote/video/long video/manual batch",
+            description="每次只选取一个可审阅批次；继续按原视频时间线推进，重试复用当前范围，并输出系列状态。",
+            inputs=[
+                LongVideoShotPlanType.Input("shot_plan", display_name="完整镜头计划"),
+                IO.Combo.Input(
+                    "action",
+                    options=["新建系列", "继续下一批", "重试当前批"],
+                    default="新建系列",
+                    display_name="批次动作",
+                ),
+                IO.String.Input("series_id", display_name="系列 ID（新建可留空）", default=""),
+                IO.Float.Input("batch_minutes", display_name="每批目标时长（分钟）", default=1.0, min=0.5, max=5.0, step=0.5),
+                IO.Float.Input("boundary_tolerance", display_name="镜头边界容差（秒）", default=10.0, min=0.0, max=30.0, step=1.0),
+            ],
+            outputs=[
+                LongVideoShotPlanType.Output("shot_plan", display_name="当前批次镜头计划"),
+                IO.Video.Output("selected_video", display_name="当前批次原视频"),
+                IO.String.Output("batch_report_json", display_name="批次范围报告 JSON"),
+                IO.String.Output("series_state_json", display_name="系列状态 JSON"),
+            ],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        shot_plan: Any,
+        action: str = "新建系列",
+        series_id: str = "",
+        batch_minutes: float = 1.0,
+        boundary_tolerance: float = 10.0,
+    ):
+        selected_plan, selected_video, report, state = select_manual_batch_range(
+            shot_plan,
+            action=str(action),
+            series_id=str(series_id),
+            batch_minutes=float(batch_minutes),
+            boundary_tolerance=float(boundary_tolerance),
+        )
+        return IO.NodeOutput(selected_plan, selected_video, report, state, ui={"text": (report, state)})
+
+
+class CompanyLongVideoManualBatchFinalizerV1(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyLongVideoManualBatchFinalizerV1",
+            display_name="提交当前批次并等待人工审阅",
+            category="company-remote/video/long video/manual batch",
+            description="当前批次完整合并后提交系列状态；输出下一次继续所需的系列状态和人工暂停提示。",
+            inputs=[
+                LongVideoJobType.Input("job", display_name="已合并当前批次的任务"),
+                IO.String.Input("series_state_json", display_name="系列状态 JSON", default=""),
+            ],
+            outputs=[
+                IO.Video.Output("video", display_name="当前批次视频"),
+                IO.String.Output("final_path", display_name="当前批次视频路径"),
+                IO.String.Output("series_state_json", display_name="已提交系列状态 JSON"),
+                IO.String.Output("status_json", display_name="人工审阅状态 JSON"),
+            ],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, job: Any, series_state_json: str = ""):
+        if not getattr(job, "manifest", None):
+            raise ValueError("没有收到有效的批次任务。")
+        if int(job.manifest.get("processing_contract_version", 0)) != MANUAL_BATCH_PROCESSING_CONTRACT_VERSION:
+            raise ValueError("当前任务不是 contract=4 手动批次任务。")
+        if series_state_json:
+            try:
+                submitted_state = json.loads(series_state_json)
+            except json.JSONDecodeError as exc:
+                raise ValueError("传入的系列状态 JSON 无法读取。") from exc
+            if not isinstance(submitted_state, dict) or submitted_state.get("contract") != MANUAL_BATCH_CONTRACT:
+                raise ValueError("传入的系列状态不是当前手动批次版本。")
+            submitted_batch = submitted_state.get("current_batch")
+            manifest_batch = job.manifest.get("manual_batch")
+            if (
+                not isinstance(submitted_batch, dict)
+                or not isinstance(manifest_batch, dict)
+                or submitted_state.get("series_id") != manifest_batch.get("series_id")
+                or submitted_batch.get("batch_id") != manifest_batch.get("batch_id")
+                or int(submitted_batch.get("attempt", -1)) != int(manifest_batch.get("attempt", -2))
+            ):
+                raise ValueError("传入的系列状态与当前批次任务不一致。")
+        if job.manifest.get("status") != "success" or not Path(str(job.manifest.get("final") or "")).is_file():
+            merge_long_video_job(job)
+        final_path = Path(str(job.manifest.get("final") or ""))
+        if not final_path.is_file():
+            raise ValueError("当前批次提交后找不到最终视频。")
+        state_info = job.manifest.get("manual_batch") if isinstance(job.manifest.get("manual_batch"), dict) else {}
+        series_id = str(state_info.get("series_id") or "")
+        state, _ = _manual_batch_read_state(series_id)
+        current_batch = state.get("current_batch") if isinstance(state.get("current_batch"), dict) else {}
+        report = {
+            "contract": MANUAL_BATCH_CONTRACT,
+            "series_id": series_id,
+            "batch_id": current_batch.get("batch_id"),
+            "status": "completed",
+            "manual_pause_after_batch": True,
+            "series_complete": bool(state.get("series_complete")),
+            "next_cursor": state.get("next_cursor"),
+            "next_action": "检查当前批次满意后，将动作改为“继续下一批”再执行。",
+            "retry_action": "不满意时选择“重试当前批”，源范围和上一批尾帧保持不变。",
+        }
+        return IO.NodeOutput(
+            InputImpl.VideoFromFile(str(final_path)),
+            str(final_path),
+            json.dumps(state, ensure_ascii=False, indent=2),
+            json.dumps(report, ensure_ascii=False, indent=2),
+            ui={"text": (json.dumps(report, ensure_ascii=False, indent=2),)},
+        )
+
+
+class CompanyLongVideoDurationAdapter(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyLongVideoDurationAdapter",
+            display_name="镜头时长适配与任务规划",
+            category="company-remote/video/long video/stages",
+            description="按视频模型时长限制拆分超长镜头，并为极短镜头记录补帧和裁回参数。",
+            inputs=[
+                LongVideoShotPlanType.Input("shot_plan", display_name="镜头计划"),
+                LongVideoAssetsType.Input("assets", display_name="已加载资产"),
+                IO.String.Input("prompt", display_name="视频提示词", multiline=True, default=""),
+                IO.Combo.Input("engine", options=["Seedance 2.0", "Wan2.7 R2V"], default="Seedance 2.0", display_name="视频引擎"),
+                IO.Combo.Input(
+                    "model",
+                    options=["Seedance 2.0 Fast", "Seedance 2.0", "wan2.7-r2v-2026-06-12"],
+                    default="Seedance 2.0 Fast",
+                    display_name="模型",
+                ),
+                _gpt_text_model_input("analysis_model", display_name="分段分析模型"),
+                IO.Int.Input("max_retries", display_name="每段最大重试次数", default=2, min=0, max=5, step=1),
+                IO.Boolean.Input("resume", display_name="复用已完成分段", default=True),
+                IO.Boolean.Input("force_rerun", display_name="强制重跑全部分段", default=False, advanced=True),
+                IO.String.Input("negative_prompt", display_name="负面提示词", multiline=True, default="", optional=True, advanced=True),
+            ],
+            outputs=[
+                LongVideoJobType.Output("job", display_name="长视频任务"),
+                IO.String.Output("plan_json", display_name="时长适配计划 JSON"),
+                IO.String.Output("manifest_path", display_name="任务 manifest 路径"),
+            ],
+            is_api_node=True,
+            is_output_node=True,
+        )
+
+    @classmethod
+    def validate_inputs(cls, analysis_model: str):
+        return _validate_gpt_text_model(analysis_model)
+
+    @classmethod
+    def execute(
+        cls,
+        shot_plan: Any,
+        assets: Any,
+        prompt: str,
+        engine: str,
+        model: str,
+        analysis_model: str = DEFAULT_OPENAI_TEXT_MODEL,
+        max_retries: int = 2,
+        resume: bool = True,
+        force_rerun: bool = False,
+        negative_prompt: str = "",
+    ):
+        normalized_engine, normalized_model = _normalize_long_video_engine_model(engine, model)
+        job = plan_long_video_job(
+            video=shot_plan.video,
+            assets=assets,
+            prompt=prompt,
+            engine=normalized_engine,
+            model=normalized_model,
+            segment_duration=int(shot_plan.fixed_duration),
+            ai_model=analysis_model,
+            max_retries=int(max_retries),
+            resume=bool(resume),
+            force_rerun=bool(force_rerun),
+            negative_prompt=negative_prompt or "",
+            shot_plan=shot_plan,
+        )
+        status = json.dumps(job.manifest, ensure_ascii=False, indent=2)
+        return IO.NodeOutput(job, status, str(job.manifest_path), ui={"text": (status,)})
+
+
+class CompanyLongVideoSegmentPlanner(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyLongVideoSegmentPlanner",
+            display_name="长视频切分与任务规划",
+            category="company-remote/video/long video/stages",
+            description="检查视频时长并建立连续的 10/15 秒逻辑片段及模型请求任务。",
+            inputs=[
+                IO.Video.Input("video", display_name="长视频"),
+                LongVideoAssetsType.Input("assets", display_name="已加载资产"),
+                IO.String.Input("prompt", display_name="视频提示词", multiline=True, default=""),
+                IO.Combo.Input("engine", options=["Seedance 2.0", "Wan2.7 R2V"], default="Seedance 2.0", display_name="视频引擎"),
+                IO.Combo.Input(
+                    "model",
+                    options=["Seedance 2.0 Fast", "Seedance 2.0", "wan2.7-r2v-2026-06-12"],
+                    default="Seedance 2.0 Fast",
+                    display_name="模型",
+                ),
+                IO.Combo.Input("segment_duration", options=[10, 15], default=10, display_name="目标分段时长（秒）"),
+                _gpt_text_model_input("analysis_model", display_name="分段分析模型"),
+                IO.Int.Input("max_retries", display_name="每段最大重试次数", default=2, min=0, max=5, step=1),
+                IO.Boolean.Input("resume", display_name="复用已完成分段", default=True),
+                IO.Boolean.Input("force_rerun", display_name="强制重跑全部分段", default=False, advanced=True),
+                IO.String.Input("negative_prompt", display_name="负面提示词", multiline=True, default="", optional=True, advanced=True),
+            ],
+            outputs=[
+                LongVideoJobType.Output("job", display_name="长视频任务"),
+                IO.String.Output("plan_json", display_name="切分计划 JSON"),
+                IO.String.Output("manifest_path", display_name="任务 manifest 路径"),
+            ],
+            is_api_node=True,
+            is_output_node=True,
+        )
+
+    @classmethod
+    def validate_inputs(cls, analysis_model: str):
+        return _validate_gpt_text_model(analysis_model)
+
+    @classmethod
+    def execute(
+        cls,
+        video: Any,
+        assets: Any,
+        prompt: str,
+        engine: str,
+        model: str,
+        segment_duration: int,
+        analysis_model: str = DEFAULT_OPENAI_TEXT_MODEL,
+        max_retries: int = 2,
+        resume: bool = True,
+        force_rerun: bool = False,
+        negative_prompt: str = "",
+    ):
+        normalized_engine, normalized_model = _normalize_long_video_engine_model(engine, model)
+        job = plan_long_video_job(
+            video=video,
+            assets=assets,
+            prompt=prompt,
+            engine=normalized_engine,
+            model=normalized_model,
+            segment_duration=int(segment_duration),
+            ai_model=analysis_model,
+            max_retries=int(max_retries),
+            resume=bool(resume),
+            force_rerun=bool(force_rerun),
+            negative_prompt=negative_prompt or "",
+        )
+        status = json.dumps(job.manifest, ensure_ascii=False, indent=2)
+        return IO.NodeOutput(job, status, str(job.manifest_path), ui={"text": (status,)})
+
+
+class CompanyLongVideoAutoAssetPlanner(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyLongVideoAutoAssetPlanner",
+            display_name="按镜头自动资产任务规划",
+            category="company-remote/video/long video/auto assets",
+            description="不要求预先列人物或背景；根据镜头计划建立首尾帧自动提取、欧美化资产和视频生成任务。",
+            inputs=[
+                LongVideoShotPlanType.Input("shot_plan", display_name="镜头计划"),
+                IO.String.Input("prompt", display_name="视频提示词", multiline=True, default=""),
+                IO.Combo.Input("engine", options=["Seedance 2.0", "Wan2.7 R2V"], default="Seedance 2.0", display_name="视频引擎"),
+                IO.Combo.Input(
+                    "model",
+                    options=["Seedance 2.0 Fast", "Seedance 2.0", "wan2.7-r2v-2026-06-12"],
+                    default="Seedance 2.0 Fast",
+                    display_name="模型",
+                ),
+                _gpt_text_model_input("analysis_model", display_name="镜头分析模型"),
+                IO.Combo.Input("image_model", options=["gpt-image-2"], default="gpt-image-2", display_name="自动资产图片模型"),
+                IO.Combo.Input("image_quality", options=["auto", "low", "medium", "high"], default="medium", display_name="自动资产图片质量"),
+                IO.Float.Input(
+                    "reuse_threshold",
+                    display_name="跨镜头复用置信度阈值",
+                    default=0.92,
+                    min=0.5,
+                    max=1.0,
+                    step=0.01,
+                ),
+                IO.Int.Input("max_retries", display_name="每段最大重试次数", default=2, min=0, max=5, step=1),
+                IO.Boolean.Input("resume", display_name="复用已完成任务和资产", default=True),
+                IO.Boolean.Input("force_rerun", display_name="强制重跑视频分段", default=False, advanced=True),
+                IO.Boolean.Input("force_rerun_assets", display_name="强制重建镜头资产", default=False, advanced=True),
+                IO.String.Input("negative_prompt", display_name="负面提示词", multiline=True, default="", optional=True, advanced=True),
+                IO.Combo.Input(
+                    "image_provider",
+                    options=GPT_IMAGE_PROVIDER_OPTIONS,
+                    default=GPT_IMAGE_PROVIDER_WISART,
+                    display_name="自动资产图片服务",
+                ),
+            ],
+            outputs=[
+                LongVideoJobType.Output("job", display_name="自动资产长视频任务"),
+                IO.String.Output("plan_json", display_name="任务计划 JSON"),
+                IO.String.Output("manifest_path", display_name="任务 manifest 路径"),
+            ],
+            is_api_node=True,
+            is_output_node=True,
+        )
+
+    @classmethod
+    def validate_inputs(cls, analysis_model: str):
+        return _validate_gpt_text_model(analysis_model)
+
+    @classmethod
+    def execute(
+        cls,
+        shot_plan: Any,
+        prompt: str,
+        engine: str,
+        model: str,
+        analysis_model: str = DEFAULT_OPENAI_TEXT_MODEL,
+        image_model: str = "gpt-image-2",
+        image_quality: str = "medium",
+        reuse_threshold: float = 0.92,
+        max_retries: int = 2,
+        resume: bool = True,
+        force_rerun: bool = False,
+        force_rerun_assets: bool = False,
+        negative_prompt: str = "",
+        image_provider: str = GPT_IMAGE_PROVIDER_WISART,
+    ):
+        normalized_engine, normalized_model = _normalize_long_video_engine_model(engine, model)
+        job = plan_long_video_auto_asset_job(
+            shot_plan=shot_plan,
+            prompt=prompt,
+            engine=normalized_engine,
+            model=normalized_model,
+            ai_model=analysis_model,
+            image_model=image_model,
+            image_quality=image_quality,
+            image_provider=image_provider,
+            reuse_threshold=float(reuse_threshold),
+            max_retries=int(max_retries),
+            resume=bool(resume),
+            force_rerun=bool(force_rerun),
+            force_rerun_assets=bool(force_rerun_assets),
+            negative_prompt=negative_prompt or "",
+        )
+        status = json.dumps(job.manifest, ensure_ascii=False, indent=2)
+        return IO.NodeOutput(job, status, str(job.manifest_path), ui={"text": (status,)})
+
+
+ANIME_LONG_VIDEO_PROMPT = (
+    "把本段重新演绎为统一的高质量二维动漫视频。参考图片是人物身份、服装、道具和环境美术的唯一视觉依据；"
+    "严格保持实际人物数量、人物关系、主要剧情顺序和场景功能。根据镜头分析文字自然设计动作、表情、走位和镜头运动。"
+    "从第一帧到最后一帧，人物与完整背景都必须保持清晰线稿、赛璐璐分层上色和统一动漫光影；"
+    "不得出现真人脸、真实皮肤、照片纹理、真人摄影画面、半真人半动漫、写实 3D 人物、风格闪回、字幕、Logo 或水印。"
+)
+
+ANIME_LONG_VIDEO_NEGATIVE_PROMPT = (
+    "真人，真实人脸，真实皮肤，照片，摄影，写实，半真人，真人背景，皮肤毛孔，镜头噪点，"
+    "写实3D，风格漂移，真人闪回，多余人物，人物复制，肢体畸形，字幕，文字，Logo，水印"
+)
+
+WESTERN_LONG_VIDEO_PROMPT = (
+    "把本段重新演绎为完整、鲜明且统一的欧美化视频。参考图片是最终人物身份、服装、道具和环境美术的唯一视觉依据；"
+    "人物必须整体重设计为符合当代欧美审美的外国人物，而不是只更换面孔：统一调整面部地域特征、发型发色、妆容、"
+    "服装鞋履、配饰、版型剪裁、材质配色和人物气质，清除残留的本土东方造型语言。"
+    "环境必须彻底重构为真实可信、地域统一的欧美国家场景，而不是轻微调色或只替换少量道具；"
+    "建筑语言、道路与公共设施、家具陈设、材质、植被、照明和生活细节都应符合选定地域的真实逻辑。"
+    "保持输入参考图对应的视觉媒介：真人素材保持高质量欧美真人电影质感，动漫、漫画或 CG 素材保持同一媒介并改成欧美版本。"
+    "严格保持实际人物数量、人物关系、主要剧情顺序和场景功能，根据镜头分析文字自然设计动作、表情、走位和镜头运动；"
+    "从第一帧到最后一帧保持人物身份、整体造型、欧美环境、媒介和光影稳定一致，不得恢复原人物或原背景，不得出现字幕、Logo 或水印。"
+)
+
+WESTERN_LONG_VIDEO_NEGATIVE_PROMPT = (
+    "只换脸，亚洲面孔残留，本土东方造型，中式古装，中式建筑，中式家具，中文招牌，本土化道路设施，"
+    "原人物残留，原服装残留，原背景残留，轻微调色，少量道具替换，地域混乱，媒介变化，风格漂移，"
+    "人物复制，身份变化，多余人物，肢体畸形，额外手指，背景跳变，字幕，文字，Logo，水印"
+)
+
+PHOTOREAL_LONG_VIDEO_PROMPT = (
+    "把本段重新演绎为统一的高质量真人影视视频。参考图片是人物身份、服装、道具和环境美术的唯一视觉依据；"
+    "严格保持实际人物数量、人物关系、主要剧情顺序和场景功能。根据镜头分析文字自然设计动作、表情、走位和镜头运动。"
+    "从第一帧到最后一帧保持自然真实的人脸、皮肤、头发、布料、建筑材质和电影光影，人物与完整背景必须稳定一致；"
+    "不得出现动漫线稿、卡通脸、插画笔触、游戏 CG、塑料皮肤、半真人半卡通、风格闪回、字幕、Logo 或水印。"
+)
+
+PHOTOREAL_LONG_VIDEO_NEGATIVE_PROMPT = (
+    "动漫，漫画，卡通，插画，二维线稿，赛璐璐，游戏CG，3D建模，塑料皮肤，假脸，过度磨皮，"
+    "半真人半卡通，风格漂移，多余人物，人物复制，肢体畸形，字幕，文字，Logo，水印"
+)
+
+CG_3D_LONG_VIDEO_PROMPT = (
+    "把本段重新演绎为统一的高质量 3D 游戏 CG 视频。参考图片是人物身份、服装、道具和环境美术的唯一视觉依据；"
+    "严格保持实际人物数量、人物关系、主要剧情顺序和场景功能。根据镜头分析文字自然设计动作、表情、走位和镜头运动。"
+    "从第一帧到最后一帧保持稳定三维造型、PBR 材质、体积光和影视级游戏过场渲染，人物与完整环境必须属于同一美术体系；"
+    "不得出现真人摄影、二维线稿、平面插画、低模、塑料质感、材质跳变、字幕、Logo 或水印。"
+)
+
+CG_3D_LONG_VIDEO_NEGATIVE_PROMPT = (
+    "真人摄影，真实照片，二维动漫，漫画线稿，平面插画，低模，塑料材质，材质穿帮，贴图错误，"
+    "风格漂移，多余人物，人物复制，肢体畸形，字幕，文字，Logo，水印"
+)
+
+COMIC_LONG_VIDEO_PROMPT = (
+    "把本段重新演绎为统一的高质量漫画插画视频。参考图片是人物身份、服装、道具和环境美术的唯一视觉依据；"
+    "严格保持实际人物数量、人物关系、主要剧情顺序和场景功能。根据镜头分析文字自然设计动作、表情、走位和镜头运动。"
+    "从第一帧到最后一帧保持稳定的手绘墨线、明确明暗块面、细腻插画上色和一致透视，人物与完整背景画风必须统一；"
+    "不得出现真人摄影纹理、3D 建模感、廉价卡通贴纸感、拼贴、画风闪回、字幕、Logo 或水印。"
+)
+
+COMIC_LONG_VIDEO_NEGATIVE_PROMPT = (
+    "真人摄影，真实皮肤，照片纹理，3D建模，游戏CG，低模，廉价卡通，贴纸感，拼贴，线条抖动，"
+    "画风漂移，多余人物，人物复制，肢体畸形，字幕，文字，Logo，水印"
+)
+
+CUSTOM_LONG_VIDEO_PROMPT = (
+    "根据用户指定的目标视觉方向重新演绎本段视频。参考图片定义人物身份、服装、道具和环境，"
+    "镜头分析文字定义剧情、动作、表情、走位和镜头运动；严格保持实际人物数量、人物关系、剧情顺序和场景功能，"
+    "并确保从第一帧到最后一帧的人物、完整背景、材质、色彩和画风稳定一致。"
+)
+
+CUSTOM_LONG_VIDEO_NEGATIVE_PROMPT = "风格漂移，多余人物，人物复制，身份变化，肢体畸形，字幕，文字，Logo，水印"
+
+TARGET_RESOURCE_WESTERN = "欧美化资源"
+TARGET_RESOURCE_PHOTOREAL = "真人写实资源"
+TARGET_RESOURCE_ANIME = "二维动漫资源"
+TARGET_RESOURCE_CG_3D = "3D / 游戏 CG 资源"
+TARGET_RESOURCE_COMIC = "漫画插画资源"
+TARGET_RESOURCE_CUSTOM = "自定义"
+TARGET_RESOURCE_OPTIONS = [
+    TARGET_RESOURCE_WESTERN,
+    TARGET_RESOURCE_PHOTOREAL,
+    TARGET_RESOURCE_ANIME,
+    TARGET_RESOURCE_CG_3D,
+    TARGET_RESOURCE_COMIC,
+    TARGET_RESOURCE_CUSTOM,
+]
+TARGET_RESOURCE_PRESETS = {
+    TARGET_RESOURCE_WESTERN: (
+        AUTO_ASSET_STYLE_WESTERN,
+        WESTERN_LONG_VIDEO_PROMPT,
+        WESTERN_LONG_VIDEO_NEGATIVE_PROMPT,
+    ),
+    TARGET_RESOURCE_PHOTOREAL: (
+        AUTO_ASSET_STYLE_PHOTOREAL,
+        PHOTOREAL_LONG_VIDEO_PROMPT,
+        PHOTOREAL_LONG_VIDEO_NEGATIVE_PROMPT,
+    ),
+    TARGET_RESOURCE_ANIME: (
+        AUTO_ASSET_STYLE_ANIME,
+        ANIME_LONG_VIDEO_PROMPT,
+        ANIME_LONG_VIDEO_NEGATIVE_PROMPT,
+    ),
+    TARGET_RESOURCE_CG_3D: (
+        AUTO_ASSET_STYLE_CG_3D,
+        CG_3D_LONG_VIDEO_PROMPT,
+        CG_3D_LONG_VIDEO_NEGATIVE_PROMPT,
+    ),
+    TARGET_RESOURCE_COMIC: (
+        AUTO_ASSET_STYLE_COMIC,
+        COMIC_LONG_VIDEO_PROMPT,
+        COMIC_LONG_VIDEO_NEGATIVE_PROMPT,
+    ),
+    TARGET_RESOURCE_CUSTOM: (
+        AUTO_ASSET_STYLE_CUSTOM,
+        CUSTOM_LONG_VIDEO_PROMPT,
+        CUSTOM_LONG_VIDEO_NEGATIVE_PROMPT,
+    ),
+}
+
+
+def _target_resource_settings(target_resource_type: str, prompt: str, negative_prompt: str) -> tuple[str, str, str, str]:
+    requested_type = str(target_resource_type or "").strip()
+    current_prompt = str(prompt or "").strip()
+    known_prompts = {value[1] for value in TARGET_RESOURCE_PRESETS.values()}
+    if not requested_type:
+        requested_type = TARGET_RESOURCE_CUSTOM if current_prompt and current_prompt not in known_prompts else TARGET_RESOURCE_ANIME
+    normalized_type = requested_type
+    if normalized_type not in TARGET_RESOURCE_PRESETS:
+        normalized_type = TARGET_RESOURCE_ANIME
+    visual_style, preset_prompt, preset_negative = TARGET_RESOURCE_PRESETS[normalized_type]
+    known_negatives = {value[2] for value in TARGET_RESOURCE_PRESETS.values()}
+    resolved_prompt = current_prompt
+    resolved_negative = str(negative_prompt or "").strip()
+    if normalized_type != TARGET_RESOURCE_CUSTOM or not resolved_prompt or resolved_prompt in known_prompts:
+        resolved_prompt = preset_prompt
+    if normalized_type != TARGET_RESOURCE_CUSTOM or not resolved_negative or resolved_negative in known_negatives:
+        resolved_negative = preset_negative
+    return normalized_type, visual_style, resolved_prompt, resolved_negative
+
+
+class CompanyLongVideoAnimeAssetPlanner(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyLongVideoAnimeAssetPlanner",
+            display_name="人物视频多风格资产任务规划",
+            category="company-remote/video/long video/auto assets",
+            description=(
+                "根据目标资源类型逐镜头生成人物与场景参考图，并让 Seedance 仅接收生成后的参考图和剧情分析文字，"
+                "不上传原分镜视频。"
+            ),
+            inputs=[
+                LongVideoShotPlanType.Input("shot_plan", display_name="镜头计划"),
+                IO.String.Input(
+                    "prompt",
+                    display_name="视频提示词",
+                    multiline=True,
+                    default=ANIME_LONG_VIDEO_PROMPT,
+                ),
+                IO.Combo.Input(
+                    "model",
+                    options=["Seedance 2.0 Fast", "Seedance 2.0"],
+                    default="Seedance 2.0 Fast",
+                    display_name="Seedance 模型",
+                ),
+                _gpt_text_model_input("analysis_model", display_name="镜头分析模型"),
+                IO.Combo.Input("image_model", options=["gpt-image-2"], default="gpt-image-2", display_name="资产图片模型"),
+                IO.Combo.Input("image_quality", options=["auto", "low", "medium", "high"], default="medium", display_name="资产图片质量"),
+                IO.Float.Input(
+                    "reuse_threshold",
+                    display_name="跨镜头复用置信度阈值",
+                    default=0.92,
+                    min=0.5,
+                    max=1.0,
+                    step=0.01,
+                ),
+                IO.Int.Input("max_retries", display_name="每段最大重试次数", default=2, min=0, max=5, step=1),
+                IO.Boolean.Input("resume", display_name="复用已完成任务和资产", default=True),
+                IO.Boolean.Input("force_rerun", display_name="强制重跑视频分段", default=False, advanced=True),
+                IO.Boolean.Input("force_rerun_assets", display_name="强制重建资产", default=False, advanced=True),
+                IO.Combo.Input(
+                    "image_provider",
+                    options=GPT_IMAGE_PROVIDER_OPTIONS,
+                    default=GPT_IMAGE_PROVIDER_WISART,
+                    display_name="资产图片服务",
+                ),
+                IO.String.Input(
+                    "negative_prompt",
+                    display_name="负面提示词",
+                    multiline=True,
+                    default=ANIME_LONG_VIDEO_NEGATIVE_PROMPT,
+                    optional=True,
+                    advanced=True,
+                ),
+                IO.Combo.Input(
+                    "target_resource_type",
+                    options=TARGET_RESOURCE_OPTIONS,
+                    default=TARGET_RESOURCE_ANIME,
+                    display_name="目标资源类型",
+                    tooltip="切换后自动填写对应的视频提示词和负面提示词，并同步改变人物、背景资产的生成风格。",
+                    optional=True,
+                ),
+            ],
+            outputs=[
+                LongVideoJobType.Output("job", display_name="多风格长视频任务"),
+                IO.String.Output("plan_json", display_name="任务计划 JSON"),
+                IO.String.Output("manifest_path", display_name="任务 manifest 路径"),
+            ],
+            is_api_node=True,
+            is_output_node=True,
+        )
+
+    @classmethod
+    def validate_inputs(cls, analysis_model: str):
+        return _validate_gpt_text_model(analysis_model)
+
+    @classmethod
+    def execute(
+        cls,
+        shot_plan: Any,
+        prompt: str,
+        model: str,
+        analysis_model: str = DEFAULT_OPENAI_TEXT_MODEL,
+        image_model: str = "gpt-image-2",
+        image_quality: str = "medium",
+        reuse_threshold: float = 0.92,
+        max_retries: int = 2,
+        resume: bool = True,
+        force_rerun: bool = False,
+        force_rerun_assets: bool = False,
+        negative_prompt: str = ANIME_LONG_VIDEO_NEGATIVE_PROMPT,
+        image_provider: str = GPT_IMAGE_PROVIDER_WISART,
+        target_resource_type: str = "",
+    ):
+        normalized_model = str(model).strip()
+        if not normalized_model.lower().startswith("seedance"):
+            normalized_model = "Seedance 2.0 Fast"
+        normalized_type, visual_style, resolved_prompt, resolved_negative = _target_resource_settings(
+            target_resource_type,
+            prompt,
+            negative_prompt,
+        )
+        job = plan_long_video_auto_asset_job(
+            shot_plan=shot_plan,
+            prompt=resolved_prompt,
+            engine="seedance",
+            model=normalized_model,
+            ai_model=analysis_model,
+            image_model=image_model,
+            image_quality=image_quality,
+            image_provider=image_provider,
+            reuse_threshold=float(reuse_threshold),
+            max_retries=int(max_retries),
+            resume=bool(resume),
+            force_rerun=bool(force_rerun),
+            force_rerun_assets=bool(force_rerun_assets),
+            negative_prompt=resolved_negative,
+            visual_style=visual_style,
+            send_source_video=False,
+            target_resource_type=normalized_type,
+        )
+        status = json.dumps(job.manifest, ensure_ascii=False, indent=2)
+        return IO.NodeOutput(job, status, str(job.manifest_path), ui={"text": (status,)})
+
+
+class CompanyLongVideoAnimeAssetPlannerV3(CompanyLongVideoAnimeAssetPlanner):
+    @classmethod
+    def define_schema(cls):
+        schema = super().define_schema()
+        schema.node_id = "CompanyLongVideoAnimeAssetPlannerV3"
+        schema.display_name = "人物视频多风格资产任务规划 v3"
+        schema.description = (
+            "按原逻辑镜头生成资产，再将不足 4 秒的相邻镜头合并为一次 Seedance 请求；"
+            "可选择保留原视频音频，默认由 Seedance 同时生成音频。"
+        )
+        schema.inputs.append(
+            IO.Boolean.Input(
+                "use_original_audio",
+                display_name="使用原视频音频",
+                default=False,
+                tooltip="关闭时由 Seedance 同时生成音频；开启时关闭生成音频并按请求组恢复原视频音频。",
+            )
+        )
+        return schema
+
+    @classmethod
+    def execute(
+        cls,
+        shot_plan: Any,
+        prompt: str,
+        model: str,
+        analysis_model: str = DEFAULT_OPENAI_TEXT_MODEL,
+        image_model: str = "gpt-image-2",
+        image_quality: str = "medium",
+        reuse_threshold: float = 0.92,
+        max_retries: int = 2,
+        resume: bool = True,
+        force_rerun: bool = False,
+        force_rerun_assets: bool = False,
+        negative_prompt: str = ANIME_LONG_VIDEO_NEGATIVE_PROMPT,
+        image_provider: str = GPT_IMAGE_PROVIDER_WISART,
+        target_resource_type: str = "",
+        use_original_audio: bool = False,
+    ):
+        normalized_model = str(model).strip()
+        if not normalized_model.lower().startswith("seedance"):
+            normalized_model = "Seedance 2.0 Fast"
+        normalized_type, visual_style, resolved_prompt, resolved_negative = _target_resource_settings(
+            target_resource_type,
+            prompt,
+            negative_prompt,
+        )
+        job = plan_long_video_auto_asset_job(
+            shot_plan=shot_plan,
+            prompt=resolved_prompt,
+            engine="seedance",
+            model=normalized_model,
+            ai_model=analysis_model,
+            image_model=image_model,
+            image_quality=image_quality,
+            image_provider=image_provider,
+            reuse_threshold=float(reuse_threshold),
+            max_retries=int(max_retries),
+            resume=bool(resume),
+            force_rerun=bool(force_rerun),
+            force_rerun_assets=bool(force_rerun_assets),
+            negative_prompt=resolved_negative,
+            visual_style=visual_style,
+            send_source_video=False,
+            target_resource_type=normalized_type,
+            processing_contract_version=3,
+            use_original_audio=bool(use_original_audio),
+        )
+        status = json.dumps(job.manifest, ensure_ascii=False, indent=2)
+        return IO.NodeOutput(job, status, str(job.manifest_path), ui={"text": (status,)})
+
+
+class CompanyLongVideoManualBatchPlannerV1(CompanyLongVideoAnimeAssetPlannerV3):
+    @classmethod
+    def define_schema(cls):
+        schema = super().define_schema()
+        schema.node_id = "CompanyLongVideoManualBatchPlannerV1"
+        schema.display_name = "手动批次 Seedance 资产任务规划 v1"
+        schema.description = "为当前可审阅批次建立 contract=4 任务；不会改动旧 v3 任务缓存。"
+        return schema
+
+    @classmethod
+    def execute(
+        cls,
+        shot_plan: Any,
+        prompt: str,
+        model: str,
+        analysis_model: str = DEFAULT_OPENAI_TEXT_MODEL,
+        image_model: str = "gpt-image-2",
+        image_quality: str = "medium",
+        reuse_threshold: float = 0.92,
+        max_retries: int = 2,
+        resume: bool = True,
+        force_rerun: bool = False,
+        force_rerun_assets: bool = False,
+        negative_prompt: str = ANIME_LONG_VIDEO_NEGATIVE_PROMPT,
+        image_provider: str = GPT_IMAGE_PROVIDER_WISART,
+        target_resource_type: str = "",
+        use_original_audio: bool = False,
+    ):
+        normalized_type, visual_style, resolved_prompt, resolved_negative = _target_resource_settings(
+            target_resource_type,
+            prompt,
+            negative_prompt,
+        )
+        batch_config = (shot_plan.config or {}).get("manual_batch", {})
+        if not isinstance(batch_config, dict) or not batch_config.get("state_path"):
+            raise ValueError("请先连接“手动批次范围与续接控制”节点的当前批次镜头计划。")
+        job = plan_long_video_auto_asset_job(
+            shot_plan=shot_plan,
+            prompt=resolved_prompt,
+            engine="seedance",
+            model=str(model or "Seedance 2.0 Fast"),
+            ai_model=analysis_model,
+            image_model=image_model,
+            image_quality=image_quality,
+            image_provider=image_provider,
+            reuse_threshold=float(reuse_threshold),
+            max_retries=int(max_retries),
+            resume=bool(resume),
+            force_rerun=bool(force_rerun),
+            force_rerun_assets=bool(force_rerun_assets),
+            negative_prompt=resolved_negative,
+            visual_style=visual_style,
+            send_source_video=False,
+            target_resource_type=normalized_type,
+            processing_contract_version=MANUAL_BATCH_PROCESSING_CONTRACT_VERSION,
+            use_original_audio=bool(use_original_audio),
+            manual_batch=dict(batch_config),
+        )
+        status = json.dumps(job.manifest, ensure_ascii=False, indent=2)
+        return IO.NodeOutput(job, status, str(job.manifest_path), ui={"text": (status,)})
+
+
+class CompanyLongVideoAutoAssetBuilder(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyLongVideoAutoAssetBuilder",
+            display_name="分镜首尾帧分析与自动欧美化资产",
+            category="company-remote/video/long video/auto assets",
+            description="逐镜头导出首中尾帧，识别主要人物与环境，再用 GPT Image 2 生成对应的欧美化人物和首尾场景参考。",
+            inputs=[
+                LongVideoJobType.Input("job", display_name="自动资产长视频任务"),
+                IO.Int.Input(
+                    "image_concurrency",
+                    display_name="图片并发数（0=无上限）",
+                    default=0,
+                    min=0,
+                    max=64,
+                    step=1,
+                    tooltip="每分析完一个镜头就立即提交人物和背景图片；0 不限制整个任务的图片并发数，大于 0 时按此数值排队。",
+                ),
+            ],
+            outputs=[
+                LongVideoJobType.Output("job", display_name="已生成镜头资产的任务"),
+                IO.String.Output("asset_report_json", display_name="镜头资产报告 JSON"),
+                IO.Image.Output("asset_previews", display_name="源帧与自动资产预览"),
+            ],
+            is_api_node=True,
+            is_output_node=True,
+        )
+
+    @classmethod
+    async def execute(cls, job: Any, image_concurrency: int = 0):
+        result, report, previews = await asyncio.to_thread(
+            build_long_video_auto_assets,
+            job,
+            int(image_concurrency),
+        )
+        return IO.NodeOutput(result, report, previews, ui={"text": (report,)})
+
+
+class CompanyLongVideoAutoReferencePacker(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyLongVideoAutoReferencePacker",
+            display_name="自动参考素材打包",
+            category="company-remote/video/long video/auto assets",
+            description="按 Seedance/Wan 的图片上限打包当前镜头的人物、首尾场景和上一段连续性参考。",
+            inputs=[LongVideoJobType.Input("job", display_name="已生成镜头资产的任务")],
+            outputs=[
+                LongVideoJobType.Output("job", display_name="已打包参考素材的任务"),
+                IO.String.Output("reference_report_json", display_name="参考素材报告 JSON"),
+                IO.Image.Output("reference_previews", display_name="自动参考包预览"),
+            ],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, job: Any):
+        result, report, previews = pack_long_video_auto_references(job)
+        return IO.NodeOutput(result, report, previews, ui={"text": (report,)})
+
+
+class CompanyLongVideoSegmentAnalyzer(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyLongVideoSegmentAnalyzer",
+            display_name="GPT 分段人物与背景分析",
+            category="company-remote/video/long video/stages",
+            description="为每个分段抽取首中尾关键帧，只分析实际人物、背景和剧情动作。",
+            inputs=[LongVideoJobType.Input("job", display_name="长视频任务")],
+            outputs=[LongVideoJobType.Output("job", display_name="已分析任务"), IO.String.Output("analysis_json", display_name="分析结果 JSON")],
+            is_api_node=True,
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, job: Any):
+        result = analyze_long_video_job(job)
+        status = json.dumps(result.manifest, ensure_ascii=False, indent=2)
+        return IO.NodeOutput(result, status, ui={"text": (status,)})
+
+
+class CompanyLongVideoReferenceMatcher(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyLongVideoReferenceMatcher",
+            display_name="分段参考素材匹配",
+            category="company-remote/video/long video/stages",
+            description="根据 GPT 分析结果，为每段匹配人物、背景和连续性参考。",
+            inputs=[LongVideoJobType.Input("job", display_name="已分析任务")],
+            outputs=[LongVideoJobType.Output("job", display_name="已匹配任务"), IO.String.Output("match_json", display_name="匹配结果 JSON")],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, job: Any):
+        result = match_long_video_references(job)
+        status = json.dumps(result.manifest, ensure_ascii=False, indent=2)
+        return IO.NodeOutput(result, status, ui={"text": (status,)})
+
+
+class CompanyLongVideoSegmentGenerator(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyLongVideoSegmentGenerator",
+            display_name="顺序生成全部视频分段",
+            category="company-remote/video/long video/stages",
+            description="按顺序调用 Seedance/Wan，失败时保存断点并只重试未完成分段。",
+            inputs=[LongVideoJobType.Input("job", display_name="已匹配任务")],
+            outputs=[LongVideoJobType.Output("job", display_name="已生成任务"), IO.String.Output("generation_json", display_name="生成状态 JSON")],
+            is_api_node=True,
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, job: Any):
+        result = generate_long_video_segments(job)
+        status = json.dumps(result.manifest, ensure_ascii=False, indent=2)
+        return IO.NodeOutput(result, status, ui={"text": (status,)})
+
+
+class CompanyLongVideoParallelSegmentGenerator(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyLongVideoParallelSegmentGenerator",
+            display_name="并行生成视频分段（实时进度）",
+            category="company-remote/video/long video/stages",
+            description=(
+                "并发调用 Seedance/Wan 生成独立视频分段；每完成一段立即推送视频预览，"
+                "失败时保存 manifest 和进度 JSON，重新执行可复用已完成分段。"
+            ),
+            inputs=[
+                LongVideoJobType.Input("job", display_name="已打包参考素材的任务"),
+                IO.Int.Input(
+                    "concurrency",
+                    display_name="并发分段数",
+                    default=3,
+                    min=1,
+                    max=8,
+                    step=1,
+                    tooltip="同时提交的远程视频分段数量；建议 2-3，过大可能触发服务端限流。",
+                ),
+            ],
+            outputs=[
+                LongVideoJobType.Output("job", display_name="已生成任务"),
+                IO.String.Output("generation_json", display_name="生成状态 JSON"),
+            ],
+            is_api_node=True,
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, job: Any, concurrency: int = 3):
+        result = generate_long_video_segments_parallel(job, int(concurrency))
+        status = json.dumps(result.manifest, ensure_ascii=False, indent=2)
+        return IO.NodeOutput(result, status, ui={"text": (status,)})
+
+
+class CompanyLongVideoResultCollector(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyLongVideoResultCollector",
+            display_name="分段结果列表",
+            category="company-remote/video/long video/stages",
+            description="核对全部分段文件并输出每段末帧预览和结果路径列表。",
+            inputs=[LongVideoJobType.Input("job", display_name="已生成任务")],
+            outputs=[
+                LongVideoJobType.Output("job", display_name="可合并任务"),
+                IO.String.Output("results_json", display_name="分段结果 JSON"),
+                IO.Image.Output("previews", display_name="各段末帧预览"),
+            ],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, job: Any):
+        result, summary, previews = collect_long_video_results(job)
+        return IO.NodeOutput(result, summary, previews, ui={"text": (summary,)})
+
+
+class CompanyLongVideoContinuityPreview(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyLongVideoContinuityPreview",
+            display_name="连续分镜生成结果预览",
+            category="company-remote/video/long video/testing",
+            description="逐段播放连续分镜生成结果，并输出每段末帧用于检查人物、动作和场景衔接。",
+            inputs=[LongVideoJobType.Input("job", display_name="已生成任务")],
+            outputs=[
+                LongVideoJobType.Output("job", display_name="可合并任务"),
+                IO.String.Output("results_json", display_name="连续性检查 JSON"),
+                IO.Image.Output("end_frames", display_name="各段末帧"),
+            ],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, job: Any):
+        result, _summary, end_frames = collect_long_video_results(job)
+        output_root = Path(folder_paths.get_output_directory()).resolve()
+        saved_results = []
+        segments = []
+        for sequence, task in enumerate(result.manifest["tasks"], start=1):
+            path = Path(task["result"]).resolve()
+            try:
+                relative = path.relative_to(output_root)
+            except ValueError as exc:
+                raise ValueError(f"第 {sequence} 段结果不在 ComfyUI output 目录内：{path}") from exc
+            saved_results.append(
+                UI.SavedResult(relative.name, relative.parent.as_posix(), IO.FolderType.output)
+            )
+            roles = list(task.get("reference_roles") or [])
+            segments.append(
+                {
+                    "sequence": sequence,
+                    "logical_shot": task.get("logical_segment"),
+                    "source_start": task.get("source_start", task.get("start")),
+                    "duration": task.get("duration"),
+                    "reference_roles": roles,
+                    "uses_previous_end_frame": "previous_segment_end_frame" in roles,
+                    "video": str(path),
+                }
+            )
+        report = json.dumps(
+            {
+                "job_id": result.manifest["job_id"],
+                "segment_count": len(segments),
+                "continuity": result.manifest.get("continuity"),
+                "segments": segments,
+                "check": "从第 2 段开始，uses_previous_end_frame 应为 true；请逐段播放检查动作、人物和背景衔接。",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        preview = UI.PreviewVideo(saved_results).as_dict()
+        preview["text"] = (report,)
+        return IO.NodeOutput(result, report, end_frames, ui=preview)
+
+
+class CompanyLongVideoFinalMerger(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyLongVideoFinalMerger",
+            display_name="合并分段并恢复原音频",
+            category="company-remote/video/long video/stages",
+            description="按时间顺序合并全部分段，并重新挂回原长视频音频。",
+            inputs=[LongVideoJobType.Input("job", display_name="可合并任务")],
+            outputs=[
+                IO.Video.Output("video", display_name="最终视频"),
+                IO.String.Output("final_path", display_name="最终视频路径"),
+                IO.String.Output("manifest_path", display_name="任务 manifest 路径"),
+                IO.String.Output("status_json", display_name="任务状态 JSON"),
+            ],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, job: Any):
+        return IO.NodeOutput(*merge_long_video_job(job))
+
+
+class CompanyLongVideoRestyle(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyLongVideoRestyle",
+            display_name="长视频欧美化分段转绘",
+            category="company-remote/video/long video",
+            description="将长视频按 10/15 秒分段，复用确认的人物与背景资产，逐段远程转绘并恢复原音频。",
+            search_aliases=["Long Video Restyle", "Long Video Batch Restyle", "长视频批处理"],
+            inputs=[
+                IO.Video.Input("video", display_name="长视频"),
+                IO.String.Input(
+                    "assets_manifest",
+                    display_name="资产清单 JSON 或路径",
+                    multiline=True,
+                    default="",
+                    tooltip="连接“长视频欧美化资产清单”的 JSON 输出，或填写 output 下 manifest.json 路径。",
+                ),
+                IO.String.Input("prompt", display_name="视频提示词", multiline=True, default=""),
+                IO.Combo.Input(
+                    "engine",
+                    options=["Seedance 2.0", "Wan2.7 R2V"],
+                    default="Seedance 2.0",
+                    display_name="视频引擎",
+                ),
+                IO.Combo.Input(
+                    "model",
+                    options=["Seedance 2.0 Fast", "Seedance 2.0", "wan2.7-r2v-2026-06-12"],
+                    default="Seedance 2.0 Fast",
+                    display_name="模型",
+                ),
+                IO.Combo.Input("segment_duration", options=[10, 15], default=10, display_name="目标分段时长（秒）"),
+                _gpt_text_model_input("analysis_model", display_name="分段分析模型"),
+                IO.Int.Input("max_retries", display_name="每段最大重试次数", default=2, min=0, max=5, step=1),
+                IO.Boolean.Input("resume", display_name="复用已完成分段", default=True),
+                IO.Boolean.Input("force_rerun", display_name="强制重跑全部分段", default=False, advanced=True),
+                IO.String.Input("negative_prompt", display_name="负面提示词", multiline=True, default="", optional=True, advanced=True),
+                *asset_image_inputs(),
+            ],
+            outputs=[
+                IO.Video.Output(display_name="最终视频"),
+                IO.String.Output(display_name="最终视频路径"),
+                IO.String.Output(display_name="任务 manifest 路径"),
+                IO.String.Output(display_name="任务状态 JSON"),
+            ],
+            is_api_node=True,
+            is_output_node=True,
+        )
+
+    @classmethod
+    def validate_inputs(cls, analysis_model: str):
+        return _validate_gpt_text_model(analysis_model)
+
+    @classmethod
+    def execute(
+        cls,
+        video: Any,
+        assets_manifest: str,
+        prompt: str,
+        engine: str,
+        model: str,
+        segment_duration: int,
+        analysis_model: str = DEFAULT_OPENAI_TEXT_MODEL,
+        max_retries: int = 2,
+        resume: bool = True,
+        force_rerun: bool = False,
+        negative_prompt: str = "",
+        **kwargs,
+    ):
+        people = connected_asset_dict(kwargs, "person_", PERSON_IDS)
+        backgrounds = connected_asset_dict(kwargs, "", BACKGROUND_IDS)
+        normalized_engine = "wan" if str(engine).lower().startswith("wan") else "seedance"
+        normalized_model = str(model).strip()
+        if normalized_engine == "wan":
+            normalized_model = "wan2.7-r2v-2026-06-12"
+        elif not normalized_model.lower().startswith("seedance"):
+            normalized_model = "Seedance 2.0 Fast"
+        return IO.NodeOutput(
+            *process_long_video(
+                video=video,
+                assets_manifest=assets_manifest,
+                prompt=prompt,
+                engine=normalized_engine,
+                model=normalized_model,
+                segment_duration=int(segment_duration),
+                ai_model=analysis_model,
+                max_retries=int(max_retries),
+                resume=bool(resume),
+                force_rerun=bool(force_rerun),
+                negative_prompt=negative_prompt or "",
+                people=people,
+                backgrounds=backgrounds,
+            )
+        )
+
+
 class CompanyGPTImage2(IO.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -618,8 +2129,8 @@ class CompanyGPTImage2(IO.ComfyNode):
             node_id="CompanyGPTImage2",
             display_name="公司 GPT Image 2 图片生成",
             category="company-remote/image/GPT Image 2",
-            description="通过 AI-Zero-Token 本地 OpenAI 兼容接口生成 GPT Image 2 图片。",
-            search_aliases=["Company GPT Image 2", "AI Zero Token GPT Image 2", "gpt-image-2"],
+            description="通过 WisArt 或 AI-Zero-Token OpenAI 兼容接口生成 GPT Image 2 图片。",
+            search_aliases=["Company GPT Image 2", "WisArt GPT Image 2", "AI Zero Token GPT Image 2", "gpt-image-2"],
             inputs=[
                 IO.String.Input(
                     "prompt",
@@ -686,7 +2197,7 @@ class CompanyGPTImage2(IO.ComfyNode):
                     min=1,
                     max=1,
                     step=1,
-                    tooltip="AI-Zero-Token 当前每次只支持生成 1 张图片。",
+                    tooltip="当前 WisArt 与 AI-Zero-Token 每次请求均生成 1 张图片。",
                     display_mode=IO.NumberDisplay.number,
                 ),
                 IO.Int.Input(
@@ -698,6 +2209,13 @@ class CompanyGPTImage2(IO.ComfyNode):
                     display_mode=IO.NumberDisplay.number,
                     control_after_generate=True,
                     tooltip="not implemented yet in backend",
+                ),
+                IO.Combo.Input(
+                    "provider",
+                    options=GPT_IMAGE_PROVIDER_OPTIONS,
+                    default=GPT_IMAGE_PROVIDER_WISART,
+                    display_name="图片服务",
+                    tooltip="WisArt 使用当前 gptimage2 配置；AI-Zero-Token 使用本地 gpttext 地址并自动切换到图片接口。",
                 ),
             ],
             outputs=[IO.Image.Output()],
@@ -711,6 +2229,7 @@ class CompanyGPTImage2(IO.ComfyNode):
         model: dict,
         n: int,
         seed: int = 0,
+        provider: str = GPT_IMAGE_PROVIDER_WISART,
     ):
         validate_string(prompt, field_name="prompt", min_length=1)
 
@@ -794,7 +2313,7 @@ class CompanyGPTImage2(IO.ComfyNode):
 
         image = await asyncio.to_thread(
             generate_openai_image,
-            _load_provider_config("gptimage2"),
+            get_gpt_image_provider_config(provider),
             prompt=prompt,
             model=model_id,
             size=size,
@@ -1632,6 +3151,159 @@ class CompanyAliyunReferenceToVideo(IO.ComfyNode):
         )
 
 
+class CompanyWan27ThreeImageDirectVideo(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyWan27ThreeImageDirectVideo",
+            display_name="Wan 2.7 三人物参考图直传视频",
+            category="company-remote/video/Alibaba Cloud",
+            description="把三张参考图以 Base64 直接提交给阿里云百炼 Wan 2.7，不经过 TOS 或火山资产库。",
+            inputs=[
+                IO.Image.Input("image_a", display_name="参考图片 1（人物 A）"),
+                IO.Image.Input("image_b", display_name="参考图片 2（人物 B）"),
+                IO.Image.Input("image_c", display_name="参考图片 3（人物 C）"),
+                IO.String.Input("prompt", display_name="视频提示词", multiline=True, default=""),
+                IO.Combo.Input(
+                    "model",
+                    display_name="模型",
+                    options=["wan2.7-r2v-2026-06-12"],
+                    default="wan2.7-r2v-2026-06-12",
+                ),
+                IO.Combo.Input("resolution", display_name="分辨率", options=["720P", "1080P"], default="720P"),
+                IO.Combo.Input("ratio", display_name="画幅比例", options=ALIYUN_VIDEO_RATIOS, default="16:9"),
+                IO.Int.Input("duration", display_name="时长（秒）", default=10, min=2, max=15, step=1),
+                IO.Boolean.Input("prompt_extend", display_name="智能改写", default=True, advanced=True),
+                IO.Boolean.Input("watermark", display_name="水印", default=False, advanced=True),
+                IO.Int.Input("seed", display_name="种子", default=0, min=0, max=2147483647, step=1),
+                IO.String.Input("negative_prompt", display_name="负面提示词", multiline=True, default="", optional=True, advanced=True),
+            ],
+            outputs=[IO.Video.Output(display_name="视频"), IO.String.Output(display_name="视频路径")],
+            is_api_node=True,
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        image_a: Any,
+        image_b: Any,
+        image_c: Any,
+        prompt: str,
+        model: str,
+        resolution: str,
+        ratio: str,
+        duration: int,
+        prompt_extend: bool = True,
+        watermark: bool = False,
+        seed: int = 0,
+        negative_prompt: str = "",
+    ):
+        config = copy.copy(_load_provider_config("aliyun_dashscope_video_direct"))
+        config.tos_enabled = False
+        config.media_delivery = "base64"
+        return generate_dashscope_video(
+            config,
+            operation="dashscope_reference_to_video",
+            model=model,
+            prompt=prompt,
+            resolution=resolution,
+            ratio=ratio,
+            duration=duration,
+            negative_prompt=negative_prompt,
+            prompt_extend=prompt_extend,
+            watermark=watermark,
+            seed=seed,
+            reference_images=[image_a, image_b, image_c],
+            reference_videos=[],
+        )
+
+
+class CompanyWan27ThreePersonVideoEdit(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="CompanyWan27ThreePersonVideoEdit",
+            display_name="Wan 2.7 原视频三人物替换",
+            category="company-remote/video/Alibaba Cloud",
+            description=(
+                "输入原视频和三张人物参考图。原视频自动上传到百炼 48 小时临时 OSS，"
+                "三张图片以 Base64 直传；不使用 TOS 或火山资产库。"
+            ),
+            inputs=[
+                IO.Video.Input("video", display_name="原视频（2-10 秒）"),
+                IO.Image.Input("image_a", display_name="图1：替换原视频人物 A"),
+                IO.Image.Input("image_b", display_name="图2：替换原视频人物 B"),
+                IO.Image.Input("image_c", display_name="图3：替换原视频人物 C"),
+                IO.String.Input("prompt", display_name="人物替换指令", multiline=True, default=""),
+                IO.Combo.Input(
+                    "model",
+                    display_name="模型",
+                    options=["wan2.7-videoedit"],
+                    default="wan2.7-videoedit",
+                ),
+                IO.Combo.Input("resolution", display_name="分辨率", options=["720P", "1080P"], default="720P"),
+                IO.Int.Input("duration", display_name="截断时长（0=原视频）", default=0, min=0, max=10, step=1),
+                IO.Combo.Input("audio_setting", display_name="声音", options=["origin", "auto"], default="origin"),
+                IO.Boolean.Input("prompt_extend", display_name="智能改写", default=True, advanced=True),
+                IO.Boolean.Input("watermark", display_name="水印", default=False, advanced=True),
+                IO.Int.Input("seed", display_name="种子", default=0, min=0, max=2147483647, step=1),
+                IO.String.Input(
+                    "negative_prompt",
+                    display_name="负面提示词",
+                    multiline=True,
+                    default="",
+                    optional=True,
+                    advanced=True,
+                ),
+            ],
+            outputs=[IO.Video.Output(display_name="视频"), IO.String.Output(display_name="视频路径")],
+            is_api_node=True,
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        video: Any,
+        image_a: Any,
+        image_b: Any,
+        image_c: Any,
+        prompt: str,
+        model: str,
+        resolution: str,
+        duration: int = 0,
+        audio_setting: str = "origin",
+        prompt_extend: bool = True,
+        watermark: bool = False,
+        seed: int = 0,
+        negative_prompt: str = "",
+    ):
+        config = copy.copy(_load_provider_config("aliyun_dashscope_video_direct"))
+        config.tos_enabled = False
+        config.media_delivery = "base64"
+        config.extra_headers = {
+            **config.extra_headers,
+            "X-DashScope-Async": "enable",
+            "X-DashScope-OssResourceResolve": "enable",
+        }
+        return generate_dashscope_video(
+            config,
+            operation="dashscope_video_edit",
+            model=model,
+            prompt=prompt,
+            resolution=resolution,
+            duration=int(duration),
+            negative_prompt=negative_prompt,
+            prompt_extend=prompt_extend,
+            watermark=watermark,
+            seed=seed,
+            edit_video=video,
+            reference_images=[image_a, image_b, image_c],
+            audio_setting=audio_setting,
+        )
+
+
 class CompanyAliyunVideoEdit(IO.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -1688,7 +3360,33 @@ NODE_CLASS_MAPPINGS = {
     "CompanyPromptEnhancer": CompanyPromptEnhancer,
     "CompanyImagePromptEnhancer": CompanyImagePromptEnhancer,
     "CompanyPersistentPromptDisplay": CompanyPersistentPromptDisplay,
+    "CompanyFixedColumnImagePreview": CompanyFixedColumnImagePreview,
     "CompanyMultiPersonPromptAnalyzer": CompanyMultiPersonPromptAnalyzer,
+    "CompanyLongVideoAssetManifest": CompanyLongVideoAssetManifest,
+    "CompanyLongVideoMappingAnalyzer": CompanyLongVideoMappingAnalyzer,
+    "CompanyLongVideoAssetLoader": CompanyLongVideoAssetLoader,
+    "CompanyLongVideoShotDetector": CompanyLongVideoShotDetector,
+    "CompanyLongVideoShotInspector": CompanyLongVideoShotInspector,
+    "CompanyLongVideoContinuityRangeSelector": CompanyLongVideoContinuityRangeSelector,
+    "CompanyLongVideoLengthRangeSelector": CompanyLongVideoLengthRangeSelector,
+    "CompanyLongVideoManualBatchRangeSelector": CompanyLongVideoManualBatchRangeSelector,
+    "CompanyLongVideoManualBatchPlannerV1": CompanyLongVideoManualBatchPlannerV1,
+    "CompanyLongVideoManualBatchFinalizerV1": CompanyLongVideoManualBatchFinalizerV1,
+    "CompanyLongVideoDurationAdapter": CompanyLongVideoDurationAdapter,
+    "CompanyLongVideoSegmentPlanner": CompanyLongVideoSegmentPlanner,
+    "CompanyLongVideoAutoAssetPlanner": CompanyLongVideoAutoAssetPlanner,
+    "CompanyLongVideoAnimeAssetPlanner": CompanyLongVideoAnimeAssetPlanner,
+    "CompanyLongVideoAnimeAssetPlannerV3": CompanyLongVideoAnimeAssetPlannerV3,
+    "CompanyLongVideoAutoAssetBuilder": CompanyLongVideoAutoAssetBuilder,
+    "CompanyLongVideoAutoReferencePacker": CompanyLongVideoAutoReferencePacker,
+    "CompanyLongVideoSegmentAnalyzer": CompanyLongVideoSegmentAnalyzer,
+    "CompanyLongVideoReferenceMatcher": CompanyLongVideoReferenceMatcher,
+    "CompanyLongVideoSegmentGenerator": CompanyLongVideoSegmentGenerator,
+    "CompanyLongVideoParallelSegmentGenerator": CompanyLongVideoParallelSegmentGenerator,
+    "CompanyLongVideoResultCollector": CompanyLongVideoResultCollector,
+    "CompanyLongVideoContinuityPreview": CompanyLongVideoContinuityPreview,
+    "CompanyLongVideoFinalMerger": CompanyLongVideoFinalMerger,
+    "CompanyLongVideoRestyle": CompanyLongVideoRestyle,
     "CompanyGPTImage2": CompanyGPTImage2,
     "CompanySeedreamImage": CompanySeedreamImage,
     "CompanySeedance2TextToVideo": CompanySeedance2TextToVideo,
@@ -1701,6 +3399,8 @@ NODE_CLASS_MAPPINGS = {
     "CompanyAliyunTextToVideo": CompanyAliyunTextToVideo,
     "CompanyAliyunImageToVideo": CompanyAliyunImageToVideo,
     "CompanyAliyunReferenceToVideo": CompanyAliyunReferenceToVideo,
+    "CompanyWan27ThreeImageDirectVideo": CompanyWan27ThreeImageDirectVideo,
+    "CompanyWan27ThreePersonVideoEdit": CompanyWan27ThreePersonVideoEdit,
     "CompanyAliyunVideoEdit": CompanyAliyunVideoEdit,
 }
 
@@ -1708,7 +3408,33 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CompanyPromptEnhancer": "公司提示词优化",
     "CompanyImagePromptEnhancer": "图片提示词优化节点",
     "CompanyPersistentPromptDisplay": "持久化提示词显示",
+    "CompanyFixedColumnImagePreview": "固定列数图片预览",
     "CompanyMultiPersonPromptAnalyzer": "多人角色识别与提示词拆分",
+    "CompanyLongVideoAssetManifest": "长视频欧美化资产清单",
+    "CompanyLongVideoMappingAnalyzer": "长视频人物与背景映射分析",
+    "CompanyLongVideoAssetLoader": "读取长视频资产清单",
+    "CompanyLongVideoShotDetector": "长视频镜头检测",
+    "CompanyLongVideoShotInspector": "分镜检测结果检查",
+    "CompanyLongVideoContinuityRangeSelector": "连续分镜测试范围选择",
+    "CompanyLongVideoLengthRangeSelector": "按时长/百分比选择生成范围",
+    "CompanyLongVideoManualBatchRangeSelector": "手动批次范围与续接控制",
+    "CompanyLongVideoManualBatchPlannerV1": "手动批次 Seedance 资产任务规划 v1",
+    "CompanyLongVideoManualBatchFinalizerV1": "提交当前批次并等待人工审阅",
+    "CompanyLongVideoDurationAdapter": "镜头时长适配与任务规划",
+    "CompanyLongVideoSegmentPlanner": "长视频切分与任务规划",
+    "CompanyLongVideoAutoAssetPlanner": "按镜头自动资产任务规划",
+    "CompanyLongVideoAnimeAssetPlanner": "人物视频多风格资产任务规划",
+    "CompanyLongVideoAnimeAssetPlannerV3": "人物视频多风格资产任务规划 v3（短镜头合并 / 音频可选）",
+    "CompanyLongVideoAutoAssetBuilder": "分镜首尾帧分析与自动欧美化资产",
+    "CompanyLongVideoAutoReferencePacker": "自动参考素材打包",
+    "CompanyLongVideoSegmentAnalyzer": "GPT 分段人物与背景分析",
+    "CompanyLongVideoReferenceMatcher": "分段参考素材匹配",
+    "CompanyLongVideoSegmentGenerator": "顺序生成全部视频分段",
+    "CompanyLongVideoParallelSegmentGenerator": "并行生成视频分段（每段完成立即显示）",
+    "CompanyLongVideoResultCollector": "分段结果列表",
+    "CompanyLongVideoContinuityPreview": "连续分镜生成结果预览",
+    "CompanyLongVideoFinalMerger": "合并分段并恢复原音频",
+    "CompanyLongVideoRestyle": "长视频欧美化分段转绘",
     "CompanyGPTImage2": "公司 GPT Image 2 图片生成",
     "CompanySeedreamImage": "公司 Seedream 图片生成 / 编辑",
     "CompanySeedance2TextToVideo": "公司 Seedance 2.0 文生视频",
@@ -1721,5 +3447,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CompanyAliyunTextToVideo": "阿里云 Wan / HappyHorse 文生视频",
     "CompanyAliyunImageToVideo": "阿里云 Wan / HappyHorse 首帧图生视频",
     "CompanyAliyunReferenceToVideo": "阿里云 Wan / HappyHorse 参考生视频",
+    "CompanyWan27ThreeImageDirectVideo": "Wan 2.7 三人物参考图直传视频",
+    "CompanyWan27ThreePersonVideoEdit": "Wan 2.7 原视频三人物替换",
     "CompanyAliyunVideoEdit": "阿里云 HappyHorse 视频编辑",
 }

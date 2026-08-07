@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import math
 import mimetypes
 import os
@@ -47,6 +48,9 @@ _THREAD_LOCAL = threading.local()
 _MODEL_CACHE_LOCK = threading.Lock()
 _MODEL_CACHE_FILE_NAME = "gpttext_models_cache.json"
 DEFAULT_OPENAI_TEXT_MODEL = "gpt-5.4"
+OPENAI_TEXT_EMPTY_RESPONSE_MAX_ATTEMPTS = 3
+
+LOGGER = logging.getLogger(__name__)
 
 
 def generate_image(
@@ -109,11 +113,19 @@ def generate_openai_image(
     }
     if files:
         payload = _build_payload(config, values=values)
-        image_items, mask_item = _openai_files_to_json_media(files)
-        payload["images"] = image_items
-        if mask_item is not None:
-            payload["mask"] = mask_item
-        response_data = _submit_openai_json(config, path="/images/edits", payload=payload)
+        if _openai_image_edit_uses_multipart(config):
+            response_data = _submit_openai_multipart(
+                config,
+                path="/images/edits",
+                payload=payload,
+                files=files,
+            )
+        else:
+            image_items, mask_item = _openai_files_to_json_media(files)
+            payload["images"] = image_items
+            if mask_item is not None:
+                payload["mask"] = mask_item
+            response_data = _submit_openai_json(config, path="/images/edits", payload=payload)
     else:
         response_data = _submit(config, _build_payload(config, values=values))
     return _openai_image_response_to_tensor(response_data, config=config)
@@ -147,15 +159,7 @@ def generate_openai_chat_text(
         ]
     payload.pop("skill", None)
     payload.pop("user_prompt", None)
-    response_data = _submit(config, payload)
-    text = _extract_openai_text(response_data, "choices.0.message.content")
-    if not text:
-        text = _extract_openai_text(response_data, "output_text")
-    if not text:
-        text = _extract_openai_text(response_data, "output.0.content.0.text")
-    if not text:
-        raise CompanyRemoteAPIError("Response did not contain text path 'choices.0.message.content' or 'output_text'.")
-    return _normalize_prompt_text(text)
+    return _submit_openai_text(config, payload, model=model)
 
 
 def generate_openai_image_prompt_text(
@@ -198,15 +202,7 @@ def generate_openai_image_prompt_text(
     payload.pop("skill", None)
     payload.pop("user_prompt", None)
 
-    response_data = _submit(config, payload)
-    text = _extract_openai_text(response_data, "choices.0.message.content")
-    if not text:
-        text = _extract_openai_text(response_data, "output_text")
-    if not text:
-        text = _extract_openai_text(response_data, "output.0.content.0.text")
-    if not text:
-        raise CompanyRemoteAPIError("Response did not contain text path 'choices.0.message.content' or 'output_text'.")
-    return _normalize_prompt_text(text)
+    return _submit_openai_text(config, payload, model=model)
 
 
 def generate_dashscope_image(
@@ -330,18 +326,31 @@ def generate_dashscope_video(
         media.extend(
             {
                 "type": "reference_video",
-                "url": _dashscope_video_url(item, config, role=f"reference_video_{index}", media_debug=media_debug),
+                "url": _dashscope_video_url(
+                    item,
+                    config,
+                    role=f"reference_video_{index}",
+                    model=model,
+                    media_debug=media_debug,
+                ),
             }
             for index, item in enumerate(reference_videos, start=1)
         )
     elif operation == "dashscope_video_edit":
         if edit_video is None:
             raise CompanyRemoteAPIError("视频编辑必须连接一个待编辑视频。")
-        if len(reference_images) > 5:
-            raise CompanyRemoteAPIError("HappyHorse 视频编辑最多支持 5 张参考图片。")
+        reference_image_limit = 4 if model == "wan2.7-videoedit" else 5
+        if len(reference_images) > reference_image_limit:
+            raise CompanyRemoteAPIError(f"{model} 视频编辑最多支持 {reference_image_limit} 张参考图片。")
         media.append({
             "type": "video",
-            "url": _dashscope_video_url(edit_video, config, role="edit_video", media_debug=media_debug),
+            "url": _dashscope_video_url(
+                edit_video,
+                config,
+                role="edit_video",
+                model=model,
+                media_debug=media_debug,
+            ),
         })
         media.extend(
             {
@@ -376,6 +385,14 @@ def generate_dashscope_video(
         parameters["ratio"] = ratio
     if operation == "dashscope_video_edit":
         parameters["audio_setting"] = audio_setting
+        if model == "wan2.7-videoedit":
+            edit_duration = int(duration)
+            if edit_duration != 0 and not 2 <= edit_duration <= 10:
+                raise CompanyRemoteAPIError(
+                    "wan2.7-videoedit 的截断时长必须为 0（沿用原视频时长）或 2-10 秒。"
+                )
+            parameters["duration"] = edit_duration
+            parameters["prompt_extend"] = bool(prompt_extend)
     elif not is_happyhorse:
         parameters["prompt_extend"] = bool(prompt_extend)
 
@@ -408,15 +425,121 @@ def _dashscope_video_url(
     config: RemoteMediaConfig,
     *,
     role: str,
+    model: str,
     media_debug: list[dict[str, Any]],
 ) -> str:
-    url = _video_to_url(video, config, role=role, media_debug=media_debug)
+    if config.tos_enabled or config.media_delivery == "tos_presigned":
+        url = _video_to_url(video, config, role=role, media_debug=media_debug)
+    else:
+        content, mime, extension, source_info = _video_to_bytes(video)
+        url, key = _upload_media_to_dashscope_temporary_oss(
+            config,
+            content=content,
+            mime=mime,
+            extension=extension,
+            role=role,
+            model=model,
+        )
+        _record_media_debug(
+            media_debug,
+            role=role,
+            media_kind="video",
+            delivery="dashscope_temp_oss",
+            mime=mime,
+            extension=extension,
+            content=content,
+            url=url,
+            object_key=key,
+            source=source_info,
+        )
     if not url.startswith(("http://", "https://", "oss://")):
         raise CompanyRemoteAPIError(
             "阿里云百炼的视频输入必须是公网 URL 或 oss:// 临时地址。"
-            "请在 aliyun_dashscope_video 配置中启用 TOS 临时签名 URL。"
         )
     return url
+
+
+def _upload_media_to_dashscope_temporary_oss(
+    config: RemoteMediaConfig,
+    *,
+    content: bytes,
+    mime: str,
+    extension: str,
+    role: str,
+    model: str,
+) -> tuple[str, str]:
+    if not content:
+        raise CompanyRemoteAPIError("不能向百炼临时存储上传空文件。")
+    if len(content) > 1024 * 1024 * 1024:
+        raise CompanyRemoteAPIError("百炼临时存储单文件不能超过 1GB。")
+    if role == "edit_video" and len(content) > 100 * 1024 * 1024:
+        raise CompanyRemoteAPIError("wan2.7-videoedit 输入视频不能超过 100MB。")
+
+    api_key = config.get_api_key()
+    if not api_key:
+        raise CompanyRemoteAPIError("阿里云百炼 API Key 未配置，无法获取临时上传凭证。")
+
+    upload_api = "https://dashscope.aliyuncs.com/api/v1/uploads"
+    hostname = (urllib.parse.urlparse(config.base_url).hostname or "").lower()
+    if "dashscope-intl" in hostname or "ap-southeast-1" in hostname:
+        upload_api = "https://dashscope-intl.aliyuncs.com/api/v1/uploads"
+
+    policy_headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    try:
+        policy_response = _request_raw(
+            "GET",
+            upload_api,
+            headers=policy_headers,
+            params={"action": "getPolicy", "model": model},
+            timeout=min(config.timeout_seconds, 30),
+        )
+    except requests.RequestException as exc:
+        raise CompanyRemoteAPIError(f"获取百炼临时上传凭证失败：{exc}") from exc
+    if not policy_response.ok:
+        raise CompanyRemoteAPIError(
+            f"获取百炼临时上传凭证失败（HTTP {policy_response.status_code}）："
+            f"{_safe_response_text(policy_response)}"
+        )
+    try:
+        policy_data = policy_response.json()["data"]
+        upload_dir = str(policy_data["upload_dir"]).strip("/")
+        upload_host = str(policy_data["upload_host"])
+    except (ValueError, KeyError, TypeError) as exc:
+        raise CompanyRemoteAPIError("百炼临时上传凭证响应缺少必要字段。") from exc
+
+    safe_role = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in role).strip("_") or "video"
+    normalized_extension = extension if extension.startswith(".") else f".{extension}"
+    filename = f"{safe_role}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:10]}{normalized_extension}"
+    key = f"{upload_dir}/{filename}"
+    files = {
+        "OSSAccessKeyId": (None, str(policy_data.get("oss_access_key_id", ""))),
+        "Signature": (None, str(policy_data.get("signature", ""))),
+        "policy": (None, str(policy_data.get("policy", ""))),
+        "x-oss-object-acl": (None, str(policy_data.get("x_oss_object_acl", ""))),
+        "x-oss-forbid-overwrite": (None, str(policy_data.get("x_oss_forbid_overwrite", ""))),
+        "key": (None, key),
+        "success_action_status": (None, "200"),
+        "file": (filename, BytesIO(content), mime or "application/octet-stream"),
+    }
+    try:
+        upload_response = _request_raw(
+            "POST",
+            upload_host,
+            files=files,
+            timeout=config.timeout_seconds,
+        )
+    except requests.RequestException as exc:
+        raise CompanyRemoteAPIError(f"上传视频到百炼临时存储失败：{exc}") from exc
+    if upload_response.status_code != 200:
+        raise CompanyRemoteAPIError(
+            f"上传视频到百炼临时存储失败（HTTP {upload_response.status_code}）："
+            f"{_safe_response_text(upload_response)}"
+        )
+    return f"oss://{key}", key
 
 
 def generate_video(
@@ -584,6 +707,56 @@ def _submit(config: RemoteMediaConfig, payload: dict[str, Any]) -> Any:
     if config.method == "GET":
         return _request_json("GET", submit_url, headers=headers, params=payload, timeout=config.timeout_seconds)
     return _request_json("POST", submit_url, headers=headers, json_body=payload, timeout=config.timeout_seconds)
+
+
+def _submit_openai_text(
+    config: RemoteMediaConfig,
+    payload: dict[str, Any],
+    *,
+    model: str,
+    max_attempts: int = OPENAI_TEXT_EMPTY_RESPONSE_MAX_ATTEMPTS,
+) -> str:
+    attempts = max(1, int(max_attempts))
+    last_response: Any = None
+    for attempt in range(1, attempts + 1):
+        last_response = _submit(config, payload)
+        text = _openai_response_text(last_response)
+        if text:
+            return _normalize_prompt_text(text)
+        if attempt < attempts:
+            LOGGER.warning(
+                "company_remote received an empty text response from model %s; retrying (%d/%d)",
+                model,
+                attempt,
+                attempts,
+            )
+            time.sleep(min(float(attempt), 2.0))
+
+    summary = _openai_empty_response_summary(last_response)
+    raise CompanyRemoteAPIError(
+        "Remote text model returned an empty response "
+        f"after {attempts} attempts ({summary})."
+    )
+
+
+def _openai_response_text(response_data: Any) -> str:
+    for path in (
+        "choices.0.message.content",
+        "output_text",
+        "output.0.content.0.text",
+    ):
+        text = _extract_openai_text(response_data, path)
+        if text:
+            return text
+    return ""
+
+
+def _openai_empty_response_summary(response_data: Any) -> str:
+    if not isinstance(response_data, dict):
+        return f"response_type={type(response_data).__name__}"
+    finish_reason = _extract_first_string(response_data, "choices.0.finish_reason") or "unknown"
+    response_id = _extract_first_string(response_data, "id") or "unknown"
+    return f"response_id={response_id}, finish_reason={finish_reason}"
 
 
 def _resolve_result_url(config: RemoteMediaConfig, response_data: Any, *, output_type: str) -> str:
@@ -863,6 +1036,40 @@ def _submit_openai_json(
         json_body=payload,
         timeout=config.timeout_seconds,
     )
+
+
+def _openai_image_edit_uses_multipart(config: RemoteMediaConfig) -> bool:
+    hostname = (urllib.parse.urlparse(config.base_url).hostname or "").lower()
+    return hostname not in {"127.0.0.1", "localhost", "::1"}
+
+
+def _submit_openai_multipart(
+    config: RemoteMediaConfig,
+    *,
+    path: str,
+    payload: dict[str, Any],
+    files: list[tuple[str, tuple[str, BytesIO, str]]],
+) -> Any:
+    headers = _build_headers(config)
+    headers.pop("Content-Type", None)
+    for _field_name, (_filename, content, _mime_type) in files:
+        content.seek(0)
+    response = _request_raw(
+        "POST",
+        _join_url(config.base_url, path),
+        headers=headers,
+        data={key: str(value) for key, value in payload.items() if value is not None},
+        files=files,
+        timeout=config.timeout_seconds,
+    )
+    if not response.ok:
+        raise CompanyRemoteAPIError(
+            f"Remote request failed with HTTP {response.status_code}: {_safe_response_text(response)}"
+        )
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise CompanyRemoteAPIError(f"Remote response is not JSON: {_safe_response_text(response)}") from exc
 
 
 def _openai_image_response_to_tensor(response_data: Any, *, config: RemoteMediaConfig):
@@ -1374,6 +1581,7 @@ def _trim_video_bytes(
     source_label: str,
     source_extension: str,
     target_seconds: float,
+    start_seconds: float = 0.0,
 ) -> bytes:
     try:
         import imageio_ffmpeg
@@ -1389,7 +1597,7 @@ def _trim_video_bytes(
 
     safe_extension = source_extension if source_extension.startswith(".") and len(source_extension) <= 10 else ".mp4"
     try:
-        with tempfile.TemporaryDirectory(prefix="company_remote_seedance_trim_") as temp_dir:
+        with tempfile.TemporaryDirectory(prefix="company_remote_video_trim_") as temp_dir:
             input_path = os.path.join(temp_dir, f"input{safe_extension}")
             output_path = os.path.join(temp_dir, "output.mp4")
             with open(input_path, "wb") as handle:
@@ -1403,28 +1611,34 @@ def _trim_video_bytes(
                 "-y",
                 "-i",
                 input_path,
-                "-t",
-                f"{target_seconds:.3f}",
-                "-map",
-                "0:v:0",
-                "-map",
-                "0:a?",
-                "-vf",
-                "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "18",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "160k",
-                "-movflags",
-                "+faststart",
-                output_path,
             ]
+            if start_seconds > 1e-9:
+                command.extend(["-ss", f"{start_seconds:.6f}"])
+            command.extend(
+                [
+                    "-t",
+                    f"{target_seconds:.6f}",
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "0:a?",
+                    "-vf",
+                    "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "18",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "160k",
+                    "-movflags",
+                    "+faststart",
+                    output_path,
+                ]
+            )
             creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
             try:
                 result = subprocess.run(
@@ -1502,6 +1716,17 @@ def _video_to_bytes(video: Any) -> tuple[bytes, str, str, dict[str, Any]]:
     if isinstance(video, _PreparedVideo):
         return video.content, video.mime, video.extension, dict(video.source_info)
 
+    trim_start = 0.0
+    trim_duration = 0.0
+    if hasattr(video, "get_active_trim_window"):
+        try:
+            trim_start, trim_duration = video.get_active_trim_window()
+            trim_start = max(0.0, float(trim_start))
+            trim_duration = max(0.0, float(trim_duration))
+        except (TypeError, ValueError):
+            trim_start = 0.0
+            trim_duration = 0.0
+
     source = video.get_stream_source() if hasattr(video, "get_stream_source") else video
     if isinstance(source, BytesIO):
         source.seek(0)
@@ -1518,6 +1743,29 @@ def _video_to_bytes(video: Any) -> tuple[bytes, str, str, dict[str, Any]]:
         source_info = {"kind": "file", "basename": os.path.basename(source)}
     else:
         raise CompanyRemoteAPIError("reference_video must be a Comfy VIDEO input or a file-like object")
+
+    if trim_start > 1e-9 or trim_duration > 1e-9:
+        if trim_duration <= 1e-9 and hasattr(video, "get_duration"):
+            trim_duration = max(0.0, float(video.get_duration()))
+        if trim_duration <= 1e-9:
+            raise CompanyRemoteAPIError("裁剪后参考视频的有效时长必须大于 0 秒。")
+        source_label = str(source_info.get("basename") or "VIDEO input")
+        content = _trim_video_bytes(
+            content,
+            source_label=source_label,
+            source_extension=extension,
+            target_seconds=trim_duration,
+            start_seconds=trim_start,
+        )
+        mime = "video/mp4"
+        extension = ".mp4"
+        source_info.update(
+            {
+                "trim_materialized": True,
+                "trim_start_seconds": round(trim_start, 6),
+                "trim_duration_seconds": round(trim_duration, 6),
+            }
+        )
     return content, mime, extension, source_info
 
 

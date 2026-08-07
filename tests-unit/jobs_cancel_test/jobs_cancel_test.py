@@ -78,6 +78,9 @@ class FakePromptQueue:
                 return True
         return False
 
+    def delete_history_item(self, prompt_id):
+        self._history.pop(prompt_id, None)
+
     def interrupt_if_running(self, prompt_id):
         # Mirrors execution.PromptQueue.interrupt_if_running: only signals an
         # interrupt when the id is actually in the running set.
@@ -149,6 +152,23 @@ def build_app(queue):
     app.router.add_post("/api/jobs/{job_id}/cancel", cancel_job_by_id)
     app.router.add_post("/api/jobs/cancel", cancel_jobs_batch)
     return app
+
+
+def delete_from_queue_or_history(queue, prompt_id):
+    """Mirror POST /queue {"delete": [...]} for compatibility tests."""
+    deleted = queue.delete_queue_item(lambda a: a[1] == prompt_id)
+    if not deleted:
+        queue.delete_history_item(prompt_id)
+    return deleted
+
+
+def interrupt_or_clear_history(queue, prompt_id):
+    """Mirror targeted POST /interrupt compatibility behavior."""
+    currently_running, _ = queue.get_current_queue()
+    if any(item[1] == prompt_id for item in currently_running):
+        return queue.interrupt_if_running(prompt_id)
+    queue.delete_history_item(prompt_id)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +370,40 @@ class TestSingleCancelEndpoint:
         assert resp.status == 200
         assert (await resp.json()) == {"cancelled": True}
         assert queue.interrupt_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Legacy UI compatibility: old queue/interrupt actions against terminal jobs
+# ---------------------------------------------------------------------------
+
+
+class TestLegacyQueueUiCompatibility:
+    def test_queue_delete_removes_terminal_history_item(self):
+        history = {"c": {"prompt": make_queue_item("c"), "outputs": {}, "status": {}}}
+        queue = FakePromptQueue(history=history)
+
+        deleted_from_pending = delete_from_queue_or_history(queue, "c")
+
+        assert deleted_from_pending is False
+        assert queue.get_history() == {}
+
+    def test_queue_delete_still_removes_pending_item(self):
+        queue = FakePromptQueue(pending=[make_queue_item("b")])
+
+        deleted_from_pending = delete_from_queue_or_history(queue, "b")
+
+        assert deleted_from_pending is True
+        assert queue.get_current_queue()[1] == []
+
+    def test_interrupt_on_terminal_history_item_clears_it(self):
+        history = {"c": {"prompt": make_queue_item("c"), "outputs": {}, "status": {}}}
+        queue = FakePromptQueue(history=history)
+
+        interrupted = interrupt_or_clear_history(queue, "c")
+
+        assert interrupted is False
+        assert queue.interrupt_count == 0
+        assert queue.get_history() == {}
 
 
 # ---------------------------------------------------------------------------

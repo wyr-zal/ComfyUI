@@ -91,7 +91,7 @@
     gpttext: {
       label: "GPT Text",
       build: () => templateConfig("gpttext", {
-        base_url: "http://127.0.0.1:8787/v1",
+        base_url: "http://localhost:8317/v1",
         submit_path: "/chat/completions",
         auth_header: "",
         auth_prefix: "",
@@ -121,7 +121,7 @@
     gptimage2: {
       label: "GPT Image 2",
       build: () => templateConfig("gptimage2", {
-        base_url: "http://127.0.0.1:8787/v1",
+        base_url: "http://localhost:8317/v1",
         submit_path: "/images/generations",
         auth_header: "",
         auth_prefix: "",

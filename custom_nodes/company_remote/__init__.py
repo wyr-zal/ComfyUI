@@ -8,10 +8,42 @@ from server import PromptServer
 
 from .client import CompanyRemoteAPIError, get_cached_openai_model_ids, get_openai_model_ids, test_connection
 from .config_store import ConfigError, RemoteMediaConfig, delete_config, get_config, load_configs, upsert_config
+from .asset_gateway import (
+    CompanySeedanceABCAssetCreate,
+    CompanySeedanceImageAssetCreate,
+    CompanySeedanceVideoABCAssetCreate,
+)
+from .asset_gateway_video import CompanySeedanceAssetGatewayThreePersonVideo
+from .face_swap_video import CompanyThreePersonFaceSwapVideo
+from .three_person_seedance_video import CompanyThreePersonSeedanceVideo
+from .three_person_wan27_video import (
+    CompanyWan27MergeThreeSegments,
+    CompanyWan27SplitThreeSegments,
+    CompanyWan27ThreePersonFullVideo,
+)
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
 
 WEB_DIRECTORY = "./web"
+
+NODE_CLASS_MAPPINGS["CompanySeedanceImageAssetCreate"] = CompanySeedanceImageAssetCreate
+NODE_DISPLAY_NAME_MAPPINGS["CompanySeedanceImageAssetCreate"] = "Seedance 真人图片注册为资产"
+NODE_CLASS_MAPPINGS["CompanySeedanceABCAssetCreate"] = CompanySeedanceABCAssetCreate
+NODE_DISPLAY_NAME_MAPPINGS["CompanySeedanceABCAssetCreate"] = "Seedance 人物 A/B/C 并行注册资产"
+NODE_CLASS_MAPPINGS["CompanySeedanceVideoABCAssetCreate"] = CompanySeedanceVideoABCAssetCreate
+NODE_DISPLAY_NAME_MAPPINGS["CompanySeedanceVideoABCAssetCreate"] = "Seedance 原视频 + 人物 A/B/C 注册资产"
+NODE_CLASS_MAPPINGS["CompanySeedanceAssetGatewayThreePersonVideo"] = CompanySeedanceAssetGatewayThreePersonVideo
+NODE_DISPLAY_NAME_MAPPINGS["CompanySeedanceAssetGatewayThreePersonVideo"] = "Seedance 资产 ID 三人物视频转换"
+NODE_CLASS_MAPPINGS["CompanyThreePersonFaceSwapVideo"] = CompanyThreePersonFaceSwapVideo
+NODE_DISPLAY_NAME_MAPPINGS["CompanyThreePersonFaceSwapVideo"] = "三人物视频流式换脸（CPU）"
+NODE_CLASS_MAPPINGS["CompanyThreePersonSeedanceVideo"] = CompanyThreePersonSeedanceVideo
+NODE_DISPLAY_NAME_MAPPINGS["CompanyThreePersonSeedanceVideo"] = "三人物整头造型 Seedance 分段转换"
+NODE_CLASS_MAPPINGS["CompanyWan27ThreePersonFullVideo"] = CompanyWan27ThreePersonFullVideo
+NODE_DISPLAY_NAME_MAPPINGS["CompanyWan27ThreePersonFullVideo"] = "Wan 2.7 三人物完整视频分段替换"
+NODE_CLASS_MAPPINGS["CompanyWan27SplitThreeSegments"] = CompanyWan27SplitThreeSegments
+NODE_DISPLAY_NAME_MAPPINGS["CompanyWan27SplitThreeSegments"] = "Wan 2.7 完整视频拆成三段"
+NODE_CLASS_MAPPINGS["CompanyWan27MergeThreeSegments"] = CompanyWan27MergeThreeSegments
+NODE_DISPLAY_NAME_MAPPINGS["CompanyWan27MergeThreeSegments"] = "Wan 2.7 三段精确合并并恢复原音频"
 
 
 def _json_error(status: int, code: str, message: str):
