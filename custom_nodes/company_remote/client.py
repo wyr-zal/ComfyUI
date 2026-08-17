@@ -32,6 +32,14 @@ class CompanyRemoteAPIError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class SeedanceAssetReference:
+    """An already-active Ark asset that must be sent as an ``asset://`` URI."""
+
+    asset_id: str
+    role: str = "reference_image"
+
+
 SEEDANCE_REFERENCE_VIDEO_MAX_SECONDS = 15.2
 SEEDANCE_REFERENCE_VIDEO_TRIM_SECONDS = 15.0
 
@@ -294,6 +302,7 @@ def generate_dashscope_video(
 ) -> tuple[Any, str]:
     prompt = _normalize_prompt_text(prompt)
     model = str(model).strip()
+    is_wan3 = model.lower() == "wan3.0-video"
     is_happyhorse = model.startswith("happyhorse-")
     reference_images = [item for item in (reference_images or []) if item is not None]
     reference_videos = [item for item in (reference_videos or []) if item is not None]
@@ -339,7 +348,7 @@ def generate_dashscope_video(
     elif operation == "dashscope_video_edit":
         if edit_video is None:
             raise CompanyRemoteAPIError("视频编辑必须连接一个待编辑视频。")
-        reference_image_limit = 4 if model == "wan2.7-videoedit" else 5
+        reference_image_limit = 10 if is_wan3 else (4 if model == "wan2.7-videoedit" else 5)
         if len(reference_images) > reference_image_limit:
             raise CompanyRemoteAPIError(f"{model} 视频编辑最多支持 {reference_image_limit} 张参考图片。")
         media.append({
@@ -384,7 +393,6 @@ def generate_dashscope_video(
     if operation in {"dashscope_text_to_video", "dashscope_reference_to_video"}:
         parameters["ratio"] = ratio
     if operation == "dashscope_video_edit":
-        parameters["audio_setting"] = audio_setting
         if model == "wan2.7-videoedit":
             edit_duration = int(duration)
             if edit_duration != 0 and not 2 <= edit_duration <= 10:
@@ -393,6 +401,19 @@ def generate_dashscope_video(
                 )
             parameters["duration"] = edit_duration
             parameters["prompt_extend"] = bool(prompt_extend)
+            parameters["audio_setting"] = audio_setting
+        elif is_wan3:
+            edit_duration = int(duration)
+            if not 2 <= edit_duration <= 30:
+                raise CompanyRemoteAPIError(
+                    "wan3.0-video 的目标时长必须为 2-30 秒。"
+                )
+            parameters["duration"] = edit_duration
+            # Wan 3.0 的音轨是可选的模型生成音频；本工作流最终统一恢复原视频音频，
+            # 因而 origin 表示不生成新音频，auto 才请求模型生成音轨。
+            parameters["audio"] = str(audio_setting).strip().lower() == "auto"
+        else:
+            parameters["audio_setting"] = audio_setting
     elif not is_happyhorse:
         parameters["prompt_extend"] = bool(prompt_extend)
 
@@ -472,7 +493,7 @@ def _upload_media_to_dashscope_temporary_oss(
         raise CompanyRemoteAPIError("不能向百炼临时存储上传空文件。")
     if len(content) > 1024 * 1024 * 1024:
         raise CompanyRemoteAPIError("百炼临时存储单文件不能超过 1GB。")
-    if role == "edit_video" and len(content) > 100 * 1024 * 1024:
+    if role == "edit_video" and model == "wan2.7-videoedit" and len(content) > 100 * 1024 * 1024:
         raise CompanyRemoteAPIError("wan2.7-videoedit 输入视频不能超过 100MB。")
 
     api_key = config.get_api_key()
@@ -1210,6 +1231,24 @@ def _image_to_url(
     media_debug: list[dict[str, Any]] | None = None,
     source_info: dict[str, Any] | None = None,
 ) -> str:
+    if isinstance(image, SeedanceAssetReference):
+        asset_id = str(image.asset_id or "").strip()
+        if not asset_id.startswith("asset-"):
+            raise CompanyRemoteAPIError(f"Seedance 素材资产 ID 格式无效：{asset_id or '为空'}。")
+        asset_uri = f"asset://{asset_id}"
+        _record_media_debug(
+            media_debug,
+            role=role,
+            media_kind="image",
+            delivery="asset_uri",
+            mime="",
+            extension="",
+            content=b"",
+            url=asset_uri,
+            object_key="",
+            source={"kind": "SeedanceAssetReference", "asset_id": asset_id, **(source_info or {})},
+        )
+        return asset_uri
     content, mime, extension = _image_to_bytes(image, config.image_format)
     source = {"kind": type(image).__name__, **(source_info or {})}
     if config.tos_enabled or config.media_delivery == "tos_presigned":

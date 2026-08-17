@@ -22,6 +22,7 @@ ANIME_V2_SOURCE = WORKFLOW_DIR / "人物视频动漫化_长视频_按镜头自�
 ANIME_V2_LIMITED_OUTPUT = WORKFLOW_DIR / "人物视频多风格转绘_长视频_按镜头自动资产转绘_Seedance版_素材库复用v2_限时生成.json"
 ANIME_V3_LIMITED_OUTPUT = WORKFLOW_DIR / "人物视频多风格转绘_长视频_按镜头自动资产转绘_Seedance版_素材库复用v3_短镜头合并_音频可选_限时生成.json"
 ANIME_V3_MANUAL_BATCH_OUTPUT = WORKFLOW_DIR / "人物视频多风格转绘_长视频_Seedance版_v3手动批次_1分钟审阅.json"
+ANIME_V3_MANUAL_BATCH_PIPELINE_OUTPUT = WORKFLOW_DIR / "人物视频多风格转绘_长视频_Seedance版_v3手动批次_1分钟审阅_流水线.json"
 ANIME_V2_PARALLEL_OUTPUT = WORKFLOW_DIR / "人物视频动漫化_长视频_按镜头自动资产转绘_Seedance版_素材库复用v2_并行生成.json"
 
 PERSON_IDS = ("A", "B", "C")
@@ -29,6 +30,17 @@ BACKGROUND_IDS = tuple(f"BG{index:02d}" for index in range(1, 9))
 ANIME_LONG_VIDEO_NEGATIVE_PROMPT = (
     "真人，真实人脸，真实皮肤，照片，摄影，写实，半真人，真人背景，皮肤毛孔，镜头噪点，"
     "写实3D，风格漂移，真人闪回，多余人物，人物复制，肢体畸形，字幕，文字，Logo，水印"
+)
+WESTERN_LONG_VIDEO_PROMPT = (
+    "把本段重新演绎为完整、鲜明且统一的欧美化视频。参考图片是最终人物身份、服装、道具和环境美术的唯一视觉依据；"
+    "人物必须整体重设计为符合当代欧美审美的外国人物，而不是只更换面孔；环境必须彻底重构为真实可信、地域统一的"
+    "欧美国家场景，而不是轻微调色。严格保持实际人物数量、人物关系、主要剧情顺序、镜头构图和场景功能，"
+    "从第一帧到最后一帧保持人物身份、整体造型、欧美环境、媒介和光影稳定一致。"
+)
+WESTERN_LONG_VIDEO_NEGATIVE_PROMPT = (
+    "只换脸，亚洲面孔残留，本土东方造型，中式古装，中式建筑，中式家具，中文招牌，本土化道路设施，"
+    "原人物残留，原服装残留，原背景残留，轻微调色，少量道具替换，地域混乱，媒介变化，风格漂移，"
+    "人物复制，身份变化，多余人物，肢体畸形，额外手指，背景跳变，字幕，文字，Logo，水印"
 )
 
 
@@ -48,6 +60,13 @@ def clone(nodes, node_id: int, new_id: int, *, title: str, pos: list[float]) -> 
 
 def set_widget(node: dict, values: list) -> None:
     node["widgets_values"] = values
+
+
+def set_named_widget_values(node: dict, updates: dict[str, object]) -> None:
+    names = [item.get("name") for item in node.get("inputs", []) if item.get("widget")]
+    current = dict(zip(names, node.get("widgets_values", []), strict=False))
+    current.update(updates)
+    node["widgets_values"] = [current.get(name, "") for name in names]
 
 
 def find_input(node: dict, name: str) -> tuple[int, dict]:
@@ -1442,14 +1461,14 @@ def build_anime_v3_limited_workflow(source: dict) -> dict:
     workflow["revision"] = 0
     workflow["extra"]["workflow_note"] = (
         "v3 独立工作流：逐个原逻辑镜头分析并生成资产；不足 4 秒的相邻镜头确定性合并后发送给 Seedance，"
-        "同组镜头的转换参考图去重并在超过上限时压缩为带标签拼图。默认由 Seedance 同时生成音频；"
+        "同组镜头只发送通过质量筛选的完整转绘画面，并按图片序号标注对应时间范围。默认由 Seedance 同时生成音频；"
         "开启使用原视频音频后关闭生成音频，并按请求组恢复原音轨。远端生成视频不裁剪，短于请求时仅补最后一帧。"
     )
     workflow["extra"]["long_video"].update(
         {
             "processing_contract_version": 3,
             "short_shot_grouping": "adjacent-short-shots-v1",
-            "reference_package_version": "labeled-contact-sheets-v1",
+            "reference_package_version": "integrated-frames-v2",
             "use_original_audio_default": False,
             "preserve_generated_video_content": True,
         }
@@ -1468,7 +1487,8 @@ def build_anime_v3_limited_workflow(source: dict) -> dict:
             stage_input("use_original_audio", "BOOLEAN", "使用原视频音频", widget=True)
         )
         planner.setdefault("widgets_values", []).append(False)
-    node_by_id[7]["title"] = "5. 按请求组打包去重后的目标人物/场景参考图"
+    node_by_id[5]["title"] = "4. 完整画面转绘并自动淘汰弱转换"
+    node_by_id[7]["title"] = "5. 只打包合格整帧并标注对应时间"
     node_by_id[9]["title"] = "6. Seedance 顺序生成完整请求组（默认同时生成音频）"
     node_by_id[10]["title"] = "7. 逐组播放检查完整画面与连续性"
     node_by_id[12]["title"] = "8. 合并完整请求组并按开关处理音频"
@@ -1539,10 +1559,18 @@ def build_anime_v3_manual_batch_workflow(source: dict) -> dict:
     planner["inputs"] = planner_inputs
     if not any(item.get("name") == "use_original_audio" for item in planner["inputs"]):
         planner["inputs"].append(stage_input("use_original_audio", "BOOLEAN", "使用原视频音频", widget=True))
-    planner["widgets_values"] = list(planner.get("widgets_values", []))
-    node_by_id[5]["title"] = "5. 只处理当前批次的人物/背景资产"
-    node_by_id[7]["title"] = "6. 打包当前批次参考图并预留续接帧"
-    node_by_id[9]["title"] = "7. Seedance 生成当前批次（顺序续接）"
+    set_named_widget_values(
+        planner,
+        {
+            "prompt": WESTERN_LONG_VIDEO_PROMPT,
+            "negative_prompt": WESTERN_LONG_VIDEO_NEGATIVE_PROMPT,
+            "target_resource_type": "欧美化资源",
+            "use_original_audio": False,
+        },
+    )
+    node_by_id[5]["title"] = "5. 整帧欧美化并自动淘汰弱转换"
+    node_by_id[7]["title"] = "6. 只打包合格整帧并标注时间"
+    node_by_id[9]["title"] = "7. Seedance 生成当前批次（仅同镜头拆分时续接）"
     node_by_id[10]["title"] = "8. 检查当前批次结果，满意后再继续"
     node_by_id[12].update(
         {
@@ -1584,6 +1612,137 @@ def build_anime_v3_manual_batch_workflow(source: dict) -> dict:
         for group in workflow.get("groups", [])
     ]
     workflow["groups"].append({"id": 5, "title": "E. 当前批次提交后暂停，人工检查后继续", "bounding": [6600, -120, 1700, 900], "color": "#8a6d3b", "flags": {}})
+    return workflow
+
+
+def build_anime_v3_manual_batch_pipeline_workflow(source: dict) -> dict:
+    """Create the real-time preview variant with global integrated-frame calibration."""
+    workflow = copy.deepcopy(source)
+    existing: dict | None = None
+    if ANIME_V3_MANUAL_BATCH_PIPELINE_OUTPUT.is_file():
+        try:
+            existing = json.loads(ANIME_V3_MANUAL_BATCH_PIPELINE_OUTPUT.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing = None
+    workflow["id"] = str(uuid.uuid5(uuid.NAMESPACE_URL, ANIME_V3_MANUAL_BATCH_PIPELINE_OUTPUT.name))
+    workflow["revision"] = 0
+    workflow.setdefault("extra", {})
+    workflow["extra"]["workflow_note"] = (
+        "实时预览版：先为当前批次生成完整画面的目标风格转绘，并自动淘汰转换太弱或构图失真的结果；"
+        "同一场景和强风格参考会复用。全部镜头完成质量比较后，只把合格整帧按时间范围交给 Seedance。"
+        "不同场景不传上一组末帧，保留结果检查、合并和每批人工审阅。"
+    )
+    workflow["extra"].setdefault("long_video", {})
+    workflow["extra"]["long_video"].update(
+        {
+            "asset_video_pipeline": True,
+            "asset_video_overlap": False,
+            "global_integrated_frame_calibration": True,
+            "pipeline_video_order": "sequential_with_same_logical_shot_continuity_only",
+            "pipeline_asset_order": "logical_member_order",
+            "intermediate_reference_review": False,
+        }
+    )
+
+    node_by_id = {node["id"]: node for node in workflow["nodes"]}
+    pipeline = make_stage_node(
+        5,
+        "CompanyLongVideoPipelineAssetVideoGenerator",
+        "5. 实时预览整帧转绘，筛选后生成 Seedance",
+        [2480, 0],
+        [720, 700],
+        [
+            stage_input("job", "长视频分段任务", "当前批次自动资产任务"),
+            stage_input("image_concurrency", "INT", "图片并发数（0=无上限）", widget=True),
+        ],
+        [
+            stage_output("已生成当前批次任务", "长视频分段任务"),
+            stage_output("流水线状态 JSON", "STRING"),
+        ],
+        [5],
+    )
+    node_by_id[5] = pipeline
+
+    if isinstance(existing, dict):
+        existing_nodes = {node.get("id"): node for node in existing.get("nodes", []) if isinstance(node, dict)}
+        for node_id in (1, 4, 13):
+            previous = existing_nodes.get(node_id)
+            current = node_by_id.get(node_id)
+            if isinstance(previous, dict) and isinstance(current, dict):
+                if isinstance(previous.get("widgets_values"), list):
+                    current["widgets_values"] = copy.deepcopy(previous["widgets_values"])
+                if isinstance(previous.get("size"), list):
+                    current["size"] = copy.deepcopy(previous["size"])
+        if isinstance(existing.get("ds"), dict):
+            workflow["ds"] = copy.deepcopy(existing["ds"])
+
+    node_by_id[10]["pos"] = [3200, 0]
+    node_by_id[10]["title"] = "6. 检查当前批次结果，满意后再继续"
+    node_by_id[11]["pos"] = [3200, 540]
+    node_by_id[12]["pos"] = [4050, 0]
+    node_by_id[12]["title"] = "7. 合并并提交当前批次，然后暂停审阅"
+    node_by_id[13]["pos"] = [4800, 0]
+    node_by_id[13]["title"] = "保存当前已审阅批次（满意后再运行下一批）"
+
+    removed_node_ids = {6, 7, 8, 9}
+    workflow["nodes"] = [
+        pipeline if node["id"] == 5 else node
+        for node in workflow["nodes"]
+        if node["id"] not in removed_node_ids
+    ]
+    workflow["links"] = [
+        link
+        for link in workflow.get("links", [])
+        if link[1] not in removed_node_ids and link[3] not in removed_node_ids
+    ]
+
+    next_link = max((int(link[0]) for link in workflow["links"]), default=0) + 1
+    workflow["links"].append([next_link, pipeline["id"], 0, node_by_id[10]["id"], 0, "长视频分段任务"])
+    workflow["last_link_id"] = max(int(workflow.get("last_link_id", 0)), next_link)
+
+    # Rebuild the LiteGraph endpoint bookkeeping after removing the intermediate nodes.
+    active_nodes = {node["id"]: node for node in workflow["nodes"]}
+    for node in active_nodes.values():
+        for item in node.get("inputs", []):
+            item["link"] = None
+        for output in node.get("outputs", []):
+            output["links"] = []
+    for link_id, source_id, source_slot, target_id, target_slot, _data_type in workflow["links"]:
+        source = active_nodes[source_id]
+        target = active_nodes[target_id]
+        source["outputs"][source_slot]["links"].append(link_id)
+        target["inputs"][target_slot]["link"] = link_id
+
+    workflow["groups"] = [
+        {
+            "id": 1,
+            "title": "A. 检测并控制当前批次",
+            "bounding": [-60, 140, 1780, 760],
+            "color": "#3f789e",
+            "flags": {},
+        },
+        {
+            "id": 2,
+            "title": "B. 资产与 Seedance 流水线（资源就绪即生成视频）",
+            "bounding": [1740, -140, 1420, 860],
+            "color": "#81683e",
+            "flags": {},
+        },
+        {
+            "id": 4,
+            "title": "C. 检查当前批次结果",
+            "bounding": [3180, -120, 840, 1180],
+            "color": "#6b5b95",
+            "flags": {},
+        },
+        {
+            "id": 5,
+            "title": "D. 当前批次提交后暂停，人工检查后继续",
+            "bounding": [4040, -120, 1400, 900],
+            "color": "#8a6d3b",
+            "flags": {},
+        },
+    ]
     return workflow
 
 
@@ -1658,6 +1817,7 @@ def main() -> None:
     parser.add_argument("--anime-v2-limited-only", action="store_true", help="只生成多风格素材库复用 v2 限时生成工作流")
     parser.add_argument("--anime-v3-limited-only", action="store_true", help="只生成 v3 短镜头合并和音频可选限时工作流")
     parser.add_argument("--anime-v3-manual-batch-only", action="store_true", help="只生成 v3 手动批次审阅工作流")
+    parser.add_argument("--anime-v3-manual-batch-pipeline-only", action="store_true", help="只生成 v3 手动批次资产视频流水线工作流")
     parser.add_argument("--anime-v2-parallel-only", action="store_true", help="只生成动漫化素材库复用 v2 并行生成工作流")
     args = parser.parse_args()
     if args.anime_v2_limited_only:
@@ -1684,6 +1844,15 @@ def main() -> None:
             encoding="utf-8",
         )
         print(ANIME_V3_MANUAL_BATCH_OUTPUT)
+        return
+    if args.anime_v3_manual_batch_pipeline_only:
+        source_path = ANIME_V3_MANUAL_BATCH_OUTPUT if ANIME_V3_MANUAL_BATCH_OUTPUT.is_file() else ANIME_V2_SOURCE
+        anime_source = json.loads(source_path.read_text(encoding="utf-8"))
+        ANIME_V3_MANUAL_BATCH_PIPELINE_OUTPUT.write_text(
+            json.dumps(build_anime_v3_manual_batch_pipeline_workflow(anime_source), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(ANIME_V3_MANUAL_BATCH_PIPELINE_OUTPUT)
         return
     if args.anime_v2_parallel_only:
         anime_source = json.loads(ANIME_V2_SOURCE.read_text(encoding="utf-8"))

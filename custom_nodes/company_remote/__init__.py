@@ -21,6 +21,7 @@ from .three_person_wan27_video import (
     CompanyWan27SplitThreeSegments,
     CompanyWan27ThreePersonFullVideo,
 )
+from .long_video import load_identity_mapping_record, save_identity_mapping_record
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
 
@@ -111,6 +112,30 @@ async def test_company_remote_config(request):
         return _json_error(502, "REMOTE_API_ERROR", str(exc))
     except Exception as exc:
         return _json_error(502, "REMOTE_TEST_FAILED", str(exc))
+
+
+@PromptServer.instance.routes.get("/api/company_remote/identity_mappings/{series_id}")
+@PromptServer.instance.routes.get("/company_remote/identity_mappings/{series_id}")
+async def get_company_remote_identity_mapping(request):
+    try:
+        return web.json_response(load_identity_mapping_record(request.match_info["series_id"]))
+    except ValueError as exc:
+        return _json_error(400, "INVALID_IDENTITY_MAPPING", str(exc))
+
+
+@PromptServer.instance.routes.put("/api/company_remote/identity_mappings/{series_id}")
+@PromptServer.instance.routes.put("/company_remote/identity_mappings/{series_id}")
+@PromptServer.instance.routes.post("/api/company_remote/identity_mappings/{series_id}")
+@PromptServer.instance.routes.post("/company_remote/identity_mappings/{series_id}")
+async def save_company_remote_identity_mapping(request):
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_error(400, "INVALID_IDENTITY_MAPPING", "请求体必须是 JSON 对象。")
+    try:
+        return web.json_response(save_identity_mapping_record(request.match_info["series_id"], body))
+    except ValueError as exc:
+        return _json_error(400, "INVALID_IDENTITY_MAPPING", str(exc))
 
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]

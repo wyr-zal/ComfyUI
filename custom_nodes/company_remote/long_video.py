@@ -9,16 +9,20 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+import urllib.parse
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import requests
 import torch
 import torch.nn.functional as torch_functional
 import av
@@ -30,11 +34,15 @@ from comfy.utils import ProgressBar
 from comfy_api.latest import IO, InputImpl
 
 from .client import (
+    CompanyRemoteAPIError,
+    SeedanceAssetReference,
     generate_dashscope_video,
+    generate_openai_chat_text,
     generate_openai_image,
     generate_openai_image_prompt_text,
     generate_video,
 )
+from .asset_gateway import publish_seedance_person_image
 from .config_store import ConfigError, get_config, get_gpt_image_provider_config
 
 
@@ -45,7 +53,7 @@ JOB_ROOT_NAME = "company_remote/long_video_jobs"
 MANUAL_BATCH_ROOT_NAME = "company_remote/manual_batch_series"
 MANUAL_BATCH_PROCESSING_CONTRACT_VERSION = 4
 MANUAL_BATCH_CONTRACT = "seedance_v3_manual_batch_v1"
-MANUAL_BATCH_REFERENCE_PACKAGE_VERSION = "manual-batch-labeled-contact-sheets-v1"
+MANUAL_BATCH_REFERENCE_PACKAGE_VERSION = "manual-batch-asset-library-v3"
 SHOT_TEST_ROOT_NAME = "company_remote/shot_detection_tests"
 MIN_REQUEST_DURATION = 2.0
 SHOT_PREVIEW_LIMIT = 32
@@ -54,11 +62,21 @@ SHOT_DETECTION_PROXY_MAX_WIDTH = 640
 SHOT_DETECTION_CPU_THREADS = 2
 AUTO_ASSET_MANIFEST_VERSION = 4
 AUTO_ASSET_MAX_PEOPLE = 3
-AUTO_ASSET_PROMPT_VERSION = "2026-07-24"
+AUTO_ASSET_PROMPT_VERSION = "2026-08-15-replacement-assets-v1"
 AUTO_ASSET_DEFAULT_REUSE_THRESHOLD = 0.92
-AUTO_ASSET_CACHE_VERSION = 2
+AUTO_ASSET_CACHE_VERSION = 3
+AUTO_ASSET_LIBRARY_VERSION = 1
 AUTO_ASSET_DIFFERENT_THRESHOLD = 0.75
 AUTO_ASSET_MAX_SOURCE_OBSERVATIONS = 6
+AUTO_ASSET_QUALITY_GATE_VERSION = "replacement-quality-v2"
+AUTO_ASSET_TARGET_STYLE_THRESHOLD = 0.85
+AUTO_ASSET_SOURCE_RESIDUE_THRESHOLD = 0.15
+AUTO_ASSET_COMPOSITION_THRESHOLD = 0.80
+AUTO_ASSET_PERSON_IDENTITY_THRESHOLD = 0.85
+AUTO_ASSET_SCENE_REPLACEMENT_THRESHOLD = 0.75
+AUTO_ASSET_MIN_PERSON_MASTER_EDGE = 96
+AUTO_ASSET_MIN_PERSON_MASTER_AREA = 12_000
+AUTO_ASSET_MIN_NEW_PERSON_CONFIDENCE = 0.80
 AUTO_ASSET_STYLE_WESTERN = "western"
 AUTO_ASSET_STYLE_ANIME = "anime_2d"
 AUTO_ASSET_STYLE_PHOTOREAL = "photoreal"
@@ -68,9 +86,11 @@ AUTO_ASSET_STYLE_CUSTOM = "custom"
 AUTO_ASSET_PROGRESS_EVENT = "company_remote.auto_asset_progress"
 V3_PROCESSING_CONTRACT_VERSION = 3
 V3_GROUPING_VERSION = "adjacent-short-shots-v1"
-V3_REFERENCE_PACKAGE_VERSION = "labeled-contact-sheets-v1"
+V3_REFERENCE_PACKAGE_VERSION = "asset-library-v3"
 V3_CONTACT_SHEET_ITEMS = 6
 V3_CONTACT_SHEET_CELL_SIZE = 512
+ANALYSIS_GATEWAY_HEALTH_TIMEOUT_SECONDS = 3
+ANALYSIS_GATEWAY_PROBE_TIMEOUT_SECONDS = 15
 
 SHOT_SENSITIVITY_PRESETS = {
     "低": {"adaptive_threshold": 4.0, "min_content_val": 20.0, "fade_threshold": 8.0},
@@ -1146,6 +1166,43 @@ def _manual_batch_attempt_dir(series_id: str, batch_id: str, attempt: int) -> Pa
     return candidate
 
 
+def _manual_batch_retry_manifest(manual_batch: dict[str, Any] | None) -> tuple[dict[str, Any], Path] | None:
+    """Load the immediately preceding attempt for a retry of the same manual batch."""
+    batch = manual_batch if isinstance(manual_batch, dict) else {}
+    if str(batch.get("action") or "") != "重试当前批":
+        return None
+    try:
+        attempt = int(batch.get("attempt", 0))
+    except (TypeError, ValueError):
+        return None
+    if attempt <= 1:
+        return None
+    previous_path = _manual_batch_attempt_dir(
+        str(batch.get("series_id") or ""),
+        str(batch.get("batch_id") or ""),
+        attempt - 1,
+    ) / "job" / "manifest.json"
+    if not previous_path.is_file():
+        return None
+    try:
+        candidate = json.loads(previous_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    previous_batch = candidate.get("manual_batch") if isinstance(candidate, dict) else None
+    if not isinstance(previous_batch, dict):
+        return None
+    for key in ("series_id", "batch_id"):
+        if str(previous_batch.get(key) or "") != str(batch.get(key) or ""):
+            return None
+    for key in ("source_start", "source_end", "source_duration"):
+        try:
+            if abs(float(previous_batch.get(key)) - float(batch.get(key))) > 0.001:
+                return None
+        except (TypeError, ValueError):
+            return None
+    return candidate, previous_path
+
+
 def _manual_batch_source_identity(video: Any) -> dict[str, Any]:
     source = video.get_stream_source() if hasattr(video, "get_stream_source") else None
     if not isinstance(source, str) or not Path(source).is_file():
@@ -1333,14 +1390,17 @@ def _manual_batch_range_plan(
         slice_end = min(end, float(shot.end))
         if slice_end - slice_start <= 0.05:
             continue
-        inside = slice_start > float(shot.start) + 0.05 or slice_end < float(shot.end) - 0.05
+        starts_inside = slice_start > float(shot.start) + 0.05
+        ends_inside = slice_end < float(shot.end) - 0.05
         slices.append(
             {
                 "source_start": round(slice_start, 6),
                 "source_end": round(slice_end, 6),
                 "source_duration": round(slice_end - slice_start, 6),
                 "parent_shot_index": int(shot.index),
-                "is_inside_shot_split": inside,
+                "is_inside_shot_split": starts_inside or ends_inside,
+                "starts_inside_shot_split": starts_inside,
+                "ends_inside_shot_split": ends_inside,
                 "asset_inheritance": "parent_logical_shot_assets",
                 "reference_inheritance": "parent_logical_shot_references",
             }
@@ -1348,6 +1408,14 @@ def _manual_batch_range_plan(
     if not slices:
         raise ValueError("无法在当前源游标和批次长度下建立有效范围。")
     return round(start, 6), round(end, 6), slices
+
+
+def _manual_batch_starts_inside_logical_shot(slices: list[dict[str, Any]]) -> bool:
+    """Whether a batch starts by continuing a logical shot from the prior batch."""
+    if not slices:
+        return False
+    first_slice = slices[0]
+    return bool(first_slice.get("starts_inside_shot_split", first_slice.get("is_inside_shot_split")))
 
 
 def select_manual_batch_range(
@@ -1358,11 +1426,22 @@ def select_manual_batch_range(
     batch_minutes: float,
     boundary_tolerance: float = 10.0,
     start_shot: int = 1,
+    start_second: float = 0.0,
+    end_second: float = 0.0,
 ) -> tuple[LongVideoShotPlan, Any, str, str]:
     if batch_minutes < 0.5 or batch_minutes > 5.0:
         raise ValueError("每批生成时长必须在 0.5-5 分钟之间。")
     if boundary_tolerance < 0 or boundary_tolerance > 30:
         raise ValueError("镜头边界容差必须在 0-30 秒之间。")
+    start_second = max(0.0, float(start_second))
+    end_second = max(0.0, float(end_second))
+    if end_second > 0.0 and end_second <= start_second + 0.05:
+        raise ValueError("指定结束秒必须大于起始秒。")
+    use_absolute_range = start_second > 0.0 or end_second > 0.0
+    if use_absolute_range and start_second >= float(plan.total_duration) - 0.05:
+        raise ValueError(
+            f"指定起始秒 {start_second:g} 超出或接近视频总长 {float(plan.total_duration):g} 秒。"
+        )
     normalized_action = str(action or "新建系列").strip()
     if normalized_action not in {"新建系列", "继续下一批", "重试当前批"}:
         raise ValueError("批次动作必须是新建系列、继续下一批或重试当前批。")
@@ -1406,18 +1485,36 @@ def select_manual_batch_range(
         source_end = float(current["source_end"])
         slices = list(current.get("virtual_slices") or [])
         batch_index = int(current["batch_index"])
-        continuity_path = str(current.get("cross_batch_final_frame") or "")
         attempt = int(current.get("attempt", 0)) + 1
     else:
+        if use_absolute_range:
+            plan_start = start_second
+            if end_second > 0.0:
+                plan_target = end_second - start_second
+                plan_tolerance = 0.0
+            else:
+                plan_target = float(batch_minutes) * 60.0
+                plan_tolerance = float(boundary_tolerance)
+        else:
+            plan_start = float(state.get("next_cursor", 0.0))
+            plan_target = float(batch_minutes) * 60.0
+            plan_tolerance = float(boundary_tolerance)
         source_start, source_end, slices = _manual_batch_range_plan(
             plan,
-            start=float(state.get("next_cursor", 0.0)),
-            target_duration=float(batch_minutes) * 60.0,
-            boundary_tolerance=float(boundary_tolerance),
+            start=plan_start,
+            target_duration=plan_target,
+            boundary_tolerance=plan_tolerance,
         )
         batch_index = int(state.get("next_batch_index", 1))
-        continuity_path = str(state.get("last_committed_final_frame") or "")
         attempt = 1
+    cross_batch_continuity = _manual_batch_starts_inside_logical_shot(slices)
+    continuity_path = (
+        str(current.get("cross_batch_final_frame") or "")
+        if is_retry and cross_batch_continuity
+        else str(state.get("last_committed_final_frame") or "")
+        if cross_batch_continuity
+        else ""
+    )
     batch_id = f"B{batch_index}_{int(round(source_start * 1000))}_{int(round(source_end * 1000))}"
     batch_dir = _manual_batch_attempt_dir(actual_series_id, batch_id, attempt)
     batch_dir.mkdir(parents=True, exist_ok=True)
@@ -1433,10 +1530,17 @@ def select_manual_batch_range(
         "source_duration": round(source_end - source_start, 6),
         "source_shot_indices": sorted({int(item["parent_shot_index"]) for item in slices}),
         "virtual_slices": slices,
+        "cross_batch_continuity": cross_batch_continuity,
         "cross_batch_final_frame": continuity_path,
         "attempt_dir": str(batch_dir),
         "state_path": str(state_path),
     }
+    if use_absolute_range and not is_retry:
+        batch["absolute_range"] = {
+            "requested_start_second": round(start_second, 6),
+            "requested_end_second": round(end_second, 6) if end_second > 0.0 else None,
+            "exact_endpoints": end_second > 0.0,
+        }
     state["current_batch"] = batch
     state["status"] = "planning"
     state["next_batch_index"] = max(int(state.get("next_batch_index", 1)), batch_index + (0 if is_retry else 1))
@@ -1758,6 +1862,22 @@ def _v3_group_members(
     return requests
 
 
+def _request_group_logical_shot_ids(group: RequestSegment | dict[str, Any]) -> set[int]:
+    values = group.logical_shots if isinstance(group, RequestSegment) else group.get("logical_segments", [])
+    if not values:
+        values = (group.logical_shot,) if isinstance(group, RequestSegment) else (group.get("logical_segment"),)
+    return {int(value) for value in values if value is not None}
+
+
+def _request_group_continues_same_logical_shot(
+    previous: RequestSegment | dict[str, Any] | None,
+    current: RequestSegment | dict[str, Any],
+) -> bool:
+    if previous is None:
+        return False
+    return bool(_request_group_logical_shot_ids(previous) & _request_group_logical_shot_ids(current))
+
+
 def build_v3_logical_members_and_request_groups(
     plan: LongVideoShotPlan,
     *,
@@ -1822,11 +1942,30 @@ def _safe_slug(value: str, default: str) -> str:
     return text[:80] or default
 
 
+_JSON_WRITE_LOCK = threading.RLock()
+_JSON_WRITE_REPLACE_ATTEMPTS = 5
+_JSON_WRITE_REPLACE_DELAY_SECONDS = 0.05
+
+
 def _atomic_write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
+    with _JSON_WRITE_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+        try:
+            temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            for attempt in range(1, _JSON_WRITE_REPLACE_ATTEMPTS + 1):
+                try:
+                    os.replace(temporary, path)
+                    return
+                except PermissionError:
+                    if attempt >= _JSON_WRITE_REPLACE_ATTEMPTS:
+                        raise
+                    time.sleep(_JSON_WRITE_REPLACE_DELAY_SECONDS * attempt)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _load_json_or_path(value: str, *, field_name: str) -> dict[str, Any]:
@@ -1884,6 +2023,101 @@ def _load_image_file(path: Path) -> torch.Tensor:
 
 def _relative_output_path(path: Path) -> str:
     return path.relative_to(Path(folder_paths.get_output_directory())).as_posix()
+
+
+def _output_image_preview(path: Path | None) -> dict[str, str] | None:
+    if path is None or not path.is_file():
+        return None
+    output_root = Path(folder_paths.get_output_directory()).resolve()
+    try:
+        relative = path.resolve().relative_to(output_root)
+    except ValueError:
+        return None
+    return {
+        "filename": relative.name,
+        "subfolder": "" if str(relative.parent) == "." else relative.parent.as_posix(),
+        "type": "output",
+    }
+
+
+def _auto_asset_preview_payload(
+    task: dict[str, Any],
+    *,
+    source_frames: dict[str, str],
+    people: list[dict[str, Any]],
+    scenes: list[dict[str, Any]],
+    integrated_frames: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    def image(value: Any) -> dict[str, str] | None:
+        return _output_image_preview(_asset_path_if_file(value))
+
+    converted: list[dict[str, Any]] = []
+    for item in people:
+        preview = image(item.get("path"))
+        if preview is None:
+            continue
+        publication = item.get("publication") if isinstance(item.get("publication"), dict) else {}
+        tos = publication.get("tos") if isinstance(publication.get("tos"), dict) else {}
+        library = publication.get("asset_library") if isinstance(publication.get("asset_library"), dict) else {}
+        converted.append(
+            {
+                "kind": "person",
+                "label": f"人物 {item.get('slot') or ''}".strip(),
+                "preview": preview,
+                "tos_status": str(tos.get("status") or "pending"),
+                "asset_library_status": str(library.get("status") or "pending"),
+                "asset_id": str(library.get("asset_id") or ""),
+                "warning": str(library.get("error") or ""),
+            }
+        )
+    for item in scenes:
+        preview = image(item.get("path"))
+        if preview is None:
+            continue
+        converted.append(
+            {
+                "kind": "scene",
+                "label": "场景开始" if item.get("role") == "scene_start" else "场景结束",
+                "preview": preview,
+                "tos_status": "direct_seedance",
+                "asset_library_status": "not_registered",
+                "asset_id": "",
+                "warning": "",
+            }
+        )
+    for item in integrated_frames or []:
+        preview = image(item.get("path"))
+        if preview is None:
+            continue
+        quality = item.get("quality") if isinstance(item.get("quality"), dict) else {}
+        converted.append(
+            {
+                "kind": "integrated_frame",
+                "label": "整帧开始" if item.get("role") == "frame_start" else "整帧结束",
+                "preview": preview,
+                "tos_status": "direct_seedance",
+                "asset_library_status": str(quality.get("verdict") or "pending"),
+                "asset_id": "",
+                "warning": "; ".join(_as_string_list(quality.get("reasons"))),
+                "quality": dict(quality),
+            }
+        )
+    return {
+        "task_index": int(task.get("index", 0) or 0),
+        "source_start": image(source_frames.get("source_start")),
+        "source_end": image(source_frames.get("source_end")),
+        "converted": converted,
+        "identity_review": [
+            {
+                "slot": str(item.get("slot") or ""),
+                "state": str(item.get("identity_state") or ""),
+                "global_person_id": str(item.get("global_person_id") or item.get("person_id") or ""),
+                "reason": str(item.get("identity_reason") or ""),
+            }
+            for item in people
+            if str(item.get("identity_state") or "")
+        ],
+    }
 
 
 def _asset_path(value: Any) -> Path | None:
@@ -2066,11 +2300,30 @@ def _auto_asset_cache_path(job: LongVideoJob) -> Path:
     return job.job_dir / "asset_cache" / "index.json"
 
 
+def _auto_asset_library_path() -> Path:
+    return Path(folder_paths.get_user_directory()) / "default" / "company_remote" / "long_video_asset_library.json"
+
+
+def _persistent_auto_asset_library_enabled() -> bool:
+    """Avoid making a user library from a test-only patched output directory."""
+    configured = getattr(folder_paths, "output_directory", "")
+    try:
+        return Path(folder_paths.get_output_directory()).resolve() == Path(str(configured)).resolve()
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def _empty_auto_asset_cache() -> dict[str, Any]:
     return {
         "version": AUTO_ASSET_CACHE_VERSION,
         "people": {"by_id": {}, "candidate_index": {}},
-        "scenes": {"by_id": {}, "candidate_index": {}},
+        "scenes": {
+            "by_id": {},
+            "candidate_index": {},
+            "style_master_id": "",
+            "style_master_path": "",
+            "style_master_quality_score": 0.0,
+        },
         "legacy": {"people": {}, "scenes": {}},
     }
 
@@ -2090,7 +2343,7 @@ def _normalize_auto_asset_cache(value: Any) -> dict[str, Any]:
         version = int(value.get("version", 1) or 1)
     except (TypeError, ValueError):
         version = 1
-    if version >= AUTO_ASSET_CACHE_VERSION:
+    if version >= 2:
         people = value.get("people") if isinstance(value.get("people"), dict) else {}
         scenes = value.get("scenes") if isinstance(value.get("scenes"), dict) else {}
         cache["people"]["by_id"].update(people.get("by_id") if isinstance(people.get("by_id"), dict) else {})
@@ -2107,6 +2360,9 @@ def _normalize_auto_asset_cache(value: Any) -> dict[str, Any]:
                 for key, ids in (scenes.get("candidate_index") if isinstance(scenes.get("candidate_index"), dict) else {}).items()
             }
         )
+        cache["scenes"]["style_master_id"] = str(scenes.get("style_master_id") or "")
+        cache["scenes"]["style_master_path"] = str(scenes.get("style_master_path") or "")
+        cache["scenes"]["style_master_quality_score"] = _score01(scenes.get("style_master_quality_score"))
         legacy = value.get("legacy") if isinstance(value.get("legacy"), dict) else {}
         cache["legacy"]["people"].update(legacy.get("people") if isinstance(legacy.get("people"), dict) else {})
         cache["legacy"]["scenes"].update(legacy.get("scenes") if isinstance(legacy.get("scenes"), dict) else {})
@@ -2119,6 +2375,141 @@ def _normalize_auto_asset_cache(value: Any) -> dict[str, Any]:
     cache["legacy"]["people"].update(people)
     cache["legacy"]["scenes"].update(scenes)
     return cache
+
+
+def _empty_identity_mapping() -> dict[str, Any]:
+    return {"version": 1, "expected_distinct_people": 0, "global_people": {}, "shot_people": {}}
+
+
+def _load_identity_mapping(value: Any) -> dict[str, Any]:
+    """Load a non-secret human identity mapping from a JSON object, string, or file path."""
+    if isinstance(value, dict):
+        payload = deepcopy(value)
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return _empty_identity_mapping()
+        path = Path(text)
+        if path.is_file():
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise ValueError(f"人物映射文件无法读取：{path}") from exc
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"人物映射不是合法 JSON：{exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("人物映射根节点必须是对象。")
+    global_people = payload.get("global_people") if isinstance(payload.get("global_people"), dict) else {}
+    shot_people = payload.get("shot_people") if isinstance(payload.get("shot_people"), dict) else {}
+    normalized_global: dict[str, dict[str, Any]] = {}
+    for key, item in global_people.items():
+        if not isinstance(item, dict):
+            continue
+        identifier = str(key).strip()
+        if not identifier:
+            continue
+        normalized_global[identifier] = {
+            "name": str(item.get("name") or identifier),
+            "asset_id": str(item.get("asset_id") or "").strip(),
+            "path": str(item.get("path") or "").strip(),
+            "status": str(item.get("status") or "confirmed").strip().lower(),
+        }
+    normalized_shot: dict[str, str] = {}
+    for key, assignment_value in shot_people.items():
+        assignment = str(assignment_value or "").strip()
+        if str(key).strip() and assignment:
+            normalized_shot[str(key).strip()] = assignment
+    return {
+        "version": int(payload.get("version", 1) or 1),
+        "expected_distinct_people": int(payload.get("expected_distinct_people", 0) or 0),
+        "global_people": normalized_global,
+        "shot_people": normalized_shot,
+    }
+
+
+def _apply_identity_mapping_to_analysis(task: dict[str, Any], mapping: dict[str, Any]) -> None:
+    analysis = task.get("auto_asset_analysis")
+    if not isinstance(analysis, dict):
+        return
+    global_people = mapping.get("global_people") if isinstance(mapping.get("global_people"), dict) else {}
+    shot_people = mapping.get("shot_people") if isinstance(mapping.get("shot_people"), dict) else {}
+    task_index = int(task.get("index", 0) or 0)
+    for person in analysis.get("people", []) if isinstance(analysis.get("people"), list) else []:
+        if not isinstance(person, dict):
+            continue
+        slot = str(person.get("slot") or "")
+        assignment = str(
+            shot_people.get(f"{task_index}:{slot}")
+            or shot_people.get(f"shot_{task_index:04d}:{slot}")
+            or ""
+        ).strip()
+        if not assignment:
+            continue
+        if assignment.lower() in {"ignore", "partial", "none"}:
+            person.update(
+                {
+                    "identity_state": "partial",
+                    "global_person_id": "",
+                    "identity_reason": "人工映射要求忽略该局部人物观察。",
+                }
+            )
+            continue
+        record = global_people.get(assignment)
+        if not isinstance(record, dict):
+            raise ValueError(f"人物映射引用了未定义的全局人物：{assignment}")
+        if str(record.get("status") or "confirmed").lower() not in {"confirmed", "active", "linked"}:
+            raise ValueError(f"全局人物 {assignment} 尚未确认，不能用于付费生成。")
+        person.update(
+            {
+                "identity_state": "linked",
+                "global_person_id": assignment,
+                "mapped_asset_id": str(record.get("asset_id") or "").strip(),
+                "mapped_asset_path": str(record.get("path") or "").strip(),
+                "identity_reason": "使用人工确认的人物映射。",
+            }
+        )
+
+
+IDENTITY_MAPPING_ROOT_NAME = "company_remote/identity_mappings"
+
+
+def _identity_mapping_store_path(series_id: str) -> Path:
+    root = (Path(folder_paths.get_output_directory()).resolve() / IDENTITY_MAPPING_ROOT_NAME).resolve()
+    path = (root / f"{_manual_batch_series_id(series_id)}.json").resolve()
+    if not path.is_relative_to(root):
+        raise ValueError("人物映射路径越出了 ComfyUI output 目录。")
+    return path
+
+
+def load_identity_mapping_record(series_id: str) -> dict[str, Any]:
+    path = _identity_mapping_store_path(series_id)
+    if not path.is_file():
+        return {
+            "series_id": _manual_batch_series_id(series_id),
+            "exists": False,
+            "path": str(path),
+            "mapping": _empty_identity_mapping(),
+        }
+    return {
+        "series_id": _manual_batch_series_id(series_id),
+        "exists": True,
+        "path": str(path),
+        "mapping": _load_identity_mapping(str(path)),
+    }
+
+
+def save_identity_mapping_record(series_id: str, payload: Any) -> dict[str, Any]:
+    mapping = _load_identity_mapping(payload)
+    path = _identity_mapping_store_path(series_id)
+    _atomic_write_json(path, mapping)
+    return {
+        "series_id": _manual_batch_series_id(series_id),
+        "exists": True,
+        "path": str(path),
+        "mapping": mapping,
+    }
 
 
 def _load_auto_asset_cache(job: LongVideoJob) -> dict[str, Any]:
@@ -2134,6 +2525,411 @@ def _load_auto_asset_cache(job: LongVideoJob) -> dict[str, Any]:
 
 def _save_auto_asset_cache(job: LongVideoJob, value: dict[str, Any]) -> None:
     _atomic_write_json(_auto_asset_cache_path(job), _normalize_auto_asset_cache(value))
+
+
+def _cache_observation_entries(value: Any) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    for item in value if isinstance(value, list) else []:
+        if isinstance(item, dict) and str(item.get("path") or "").strip():
+            entries.append({str(key): str(item[key]) for key in ("kind", "index", "path", "description") if item.get(key) is not None})
+    return entries
+
+
+def _merge_auto_asset_cache_data(
+    destination: dict[str, Any],
+    source: dict[str, Any],
+    *,
+    persistent_library: bool = False,
+) -> None:
+    """Merge verified cache records without copying the underlying image files."""
+    normalized_destination = _normalize_auto_asset_cache(destination)
+    normalized_source = _normalize_auto_asset_cache(source)
+    destination.clear()
+    destination.update(normalized_destination)
+
+    target_people = destination["people"].setdefault("by_id", {})
+    for person_id, value in normalized_source["people"].get("by_id", {}).items():
+        if not isinstance(value, dict):
+            continue
+        incoming = deepcopy(value)
+        incoming_id = str(person_id)
+        if incoming_id in target_people and target_people[incoming_id].get("converted_path") != incoming.get("converted_path"):
+            incoming_id = f"library_{hashlib.sha256(str(incoming.get('converted_path') or person_id).encode('utf-8')).hexdigest()[:16]}"
+            incoming["person_id"] = incoming_id
+        if persistent_library:
+            incoming["persistent_library"] = True
+        record = target_people.setdefault(incoming_id, incoming)
+        if record is not incoming:
+            if not record.get("converted_path"):
+                record["converted_path"] = str(incoming.get("converted_path") or "")
+            if not record.get("appearance"):
+                record["appearance"] = str(incoming.get("appearance") or "")
+            incoming_publication = incoming.get("publication")
+            recorded_publication = record.get("publication")
+            incoming_library = (
+                incoming_publication.get("asset_library") if isinstance(incoming_publication, dict) else {}
+            )
+            recorded_library = (
+                recorded_publication.get("asset_library") if isinstance(recorded_publication, dict) else {}
+            )
+            incoming_is_active = str(incoming_library.get("status") or "").lower() == "active"
+            recorded_is_active = str(recorded_library.get("status") or "").lower() == "active"
+            if isinstance(incoming_publication, dict) and (not isinstance(recorded_publication, dict) or incoming_is_active and not recorded_is_active):
+                record["publication"] = deepcopy(incoming_publication)
+            if persistent_library:
+                record["persistent_library"] = True
+            keys = record.setdefault("identity_keys", [])
+            for identity_key in _normalized_id_list(incoming.get("identity_keys")):
+                if identity_key not in keys:
+                    keys.append(identity_key)
+            _append_source_observations(record, _cache_observation_entries(incoming.get("source_observations")))
+        for identity_key in _normalized_id_list(record.get("identity_keys")):
+            _append_candidate_index(destination, "person", identity_key, incoming_id)
+
+    target_places = destination["scenes"].setdefault("by_id", {})
+    for place_id, value in normalized_source["scenes"].get("by_id", {}).items():
+        if not isinstance(value, dict):
+            continue
+        incoming = deepcopy(value)
+        incoming_id = str(place_id)
+        if incoming_id in target_places and target_places[incoming_id].get("style_master_path") != incoming.get("style_master_path"):
+            incoming_id = f"library_{hashlib.sha256(str(incoming.get('style_master_path') or place_id).encode('utf-8')).hexdigest()[:16]}"
+            incoming["place_id"] = incoming_id
+        if persistent_library:
+            incoming["persistent_library"] = True
+        place = target_places.setdefault(incoming_id, incoming)
+        if place is not incoming:
+            if not place.get("description"):
+                place["description"] = str(incoming.get("description") or "")
+            if not place.get("style_master_path"):
+                place["style_master_path"] = str(incoming.get("style_master_path") or "")
+            if persistent_library:
+                place["persistent_library"] = True
+            scene_keys = place.setdefault("scene_keys", [])
+            for scene_key in _normalized_id_list(incoming.get("scene_keys")):
+                if scene_key not in scene_keys:
+                    scene_keys.append(scene_key)
+            target_versions = place.setdefault("versions", {})
+            for version_id, version in (incoming.get("versions") if isinstance(incoming.get("versions"), dict) else {}).items():
+                if not isinstance(version, dict):
+                    continue
+                if str(version_id) not in target_versions:
+                    target_versions[str(version_id)] = deepcopy(version)
+                else:
+                    _append_source_observations(
+                        target_versions[str(version_id)],
+                        _cache_observation_entries(version.get("source_observations")),
+                    )
+        for scene_key in _normalized_id_list(place.get("scene_keys")):
+            _append_candidate_index(destination, "scene", scene_key, incoming_id)
+
+
+def _auto_asset_cache_contract(cache_path: Path) -> tuple[str, str]:
+    manifest_path = cache_path.parent.parent / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return "", ""
+    options = manifest.get("auto_asset_options") if isinstance(manifest, dict) else None
+    options = options if isinstance(options, dict) else {}
+    style = _normalize_auto_asset_style(options.get("visual_style")) if options.get("visual_style") else ""
+    return style, str(options.get("prompt_version") or manifest.get("prompt_version") or "")
+
+
+def _auto_asset_library_seed_paths(visual_style: str) -> list[Path]:
+    root = Path(folder_paths.get_output_directory()) / "company_remote"
+    if not root.is_dir():
+        return []
+    style = _normalize_auto_asset_style(visual_style)
+    return sorted(
+        (
+            path
+            for path in root.glob("**/asset_cache/index.json")
+            if _auto_asset_cache_contract(path) == (style, AUTO_ASSET_PROMPT_VERSION)
+        ),
+        key=lambda path: path.stat().st_mtime,
+    )
+
+
+def _load_auto_asset_library(visual_style: str) -> dict[str, Any]:
+    if not _persistent_auto_asset_library_enabled():
+        return _empty_auto_asset_cache()
+    style = _normalize_auto_asset_style(visual_style)
+    path = _auto_asset_library_path()
+    expected_output_root = str(Path(folder_paths.get_output_directory()).resolve())
+    if path.is_file():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            styles = payload.get("styles") if isinstance(payload, dict) and payload.get("output_root") == expected_output_root else None
+            style_record = styles.get(style) if isinstance(styles, dict) else None
+            cache = style_record.get("cache") if isinstance(style_record, dict) else None
+            if isinstance(cache, dict):
+                return _normalize_auto_asset_cache(cache)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            logging.warning("Unable to load the persistent auto-asset library.", exc_info=True)
+
+    cache = _empty_auto_asset_cache()
+    source_count = 0
+    for cache_path in _auto_asset_library_seed_paths(style):
+        try:
+            source = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(source, dict):
+            continue
+        _merge_auto_asset_cache_data(cache, source, persistent_library=True)
+        source_count += 1
+    if source_count:
+        _save_auto_asset_library(cache, visual_style=style, imported_cache_count=source_count)
+    return cache
+
+
+def _save_auto_asset_library(
+    cache: dict[str, Any],
+    *,
+    visual_style: str,
+    imported_cache_count: int | None = None,
+) -> None:
+    if not _persistent_auto_asset_library_enabled():
+        return
+    normalized = _normalize_auto_asset_cache(cache)
+    path = _auto_asset_library_path()
+    styles: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            previous = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(previous, dict) and isinstance(previous.get("styles"), dict):
+                styles = dict(previous["styles"])
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            logging.warning("Unable to preserve other persistent auto-asset library styles.", exc_info=True)
+    style_record: dict[str, Any] = {"cache": normalized}
+    if imported_cache_count is not None:
+        style_record["imported_cache_count"] = int(imported_cache_count)
+    styles[_normalize_auto_asset_style(visual_style)] = style_record
+    payload: dict[str, Any] = {
+        "version": AUTO_ASSET_LIBRARY_VERSION,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "output_root": str(Path(folder_paths.get_output_directory()).resolve()),
+        "styles": styles,
+    }
+    _atomic_write_json(path, payload)
+
+
+ASSET_LIBRARY_ALL_STYLES = "all"
+ASSET_LIBRARY_GRID_CELL = 320
+ASSET_LIBRARY_GRID_LABEL_HEIGHT = 92
+
+
+def _read_asset_library_styles() -> dict[str, dict[str, Any]]:
+    """Read every style cache from the persistent library file without seeding.
+
+    Read-only: unlike ``_load_auto_asset_library`` this never rebuilds the library
+    from job caches, so a viewer node can list what is already registered without
+    side effects.
+    """
+    path = _auto_asset_library_path()
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        logging.warning("Unable to read the persistent auto-asset library for viewing.", exc_info=True)
+        return {}
+    expected_output_root = str(Path(folder_paths.get_output_directory()).resolve())
+    if not isinstance(payload, dict) or payload.get("output_root") != expected_output_root:
+        return {}
+    styles = payload.get("styles") if isinstance(payload.get("styles"), dict) else {}
+    result: dict[str, dict[str, Any]] = {}
+    for style, record in styles.items():
+        cache = record.get("cache") if isinstance(record, dict) else None
+        if isinstance(cache, dict):
+            result[str(style)] = _normalize_auto_asset_cache(cache)
+    return result
+
+
+def _person_library_entry(style: str, person_id: str, record: dict[str, Any]) -> dict[str, Any]:
+    publication = record.get("publication") if isinstance(record.get("publication"), dict) else {}
+    library = publication.get("asset_library") if isinstance(publication.get("asset_library"), dict) else {}
+    active_asset_id = _active_person_asset_id(record)
+    path = _asset_path_if_file(record.get("converted_path"))
+    return {
+        "type": "person",
+        "style": style,
+        "id": str(person_id),
+        "appearance": str(record.get("appearance") or ""),
+        "asset_id": active_asset_id or str(library.get("asset_id") or ""),
+        "registered": bool(active_asset_id),
+        "library_status": str(library.get("status") or ("none" if not library else "")),
+        "path": str(path) if path is not None else "",
+        "has_image": path is not None,
+        "identity_keys": _normalized_id_list(record.get("identity_keys")),
+        "persistent_library": bool(record.get("persistent_library")),
+    }
+
+
+def _scene_library_entry(style: str, place_id: str, record: dict[str, Any]) -> dict[str, Any]:
+    path = _asset_path_if_file(record.get("style_master_path")) or _asset_path_if_file(record.get("path"))
+    return {
+        "type": "scene",
+        "style": style,
+        "id": str(place_id),
+        "description": str(record.get("description") or ""),
+        "asset_id": "",
+        "registered": False,
+        "library_status": "local",
+        "path": str(path) if path is not None else "",
+        "has_image": path is not None,
+        "scene_keys": _normalized_id_list(record.get("scene_keys")),
+        "persistent_library": bool(record.get("persistent_library")),
+    }
+
+
+def collect_registered_asset_inventory(
+    visual_style: str = "",
+    *,
+    job: LongVideoJob | None = None,
+) -> dict[str, Any]:
+    """Enumerate registered person and scene assets from the persistent library.
+
+    Optionally fold in the current job cache so in-progress assets that have not yet
+    reached the shared library are also visible. Read-only; no remote calls.
+    """
+    requested = str(visual_style or "").strip()
+    wanted = None if requested in {"", ASSET_LIBRARY_ALL_STYLES, "全部", "全部样式"} else {_normalize_auto_asset_style(requested)}
+
+    people_entries: list[dict[str, Any]] = []
+    scene_entries: list[dict[str, Any]] = []
+    seen_people: set[str] = set()
+    seen_scenes: set[str] = set()
+
+    def add_cache(style_label: str, cache: dict[str, Any]) -> None:
+        people = cache.get("people") if isinstance(cache.get("people"), dict) else {}
+        for person_id, record in (people.get("by_id") or {}).items():
+            if not isinstance(record, dict):
+                continue
+            entry = _person_library_entry(style_label, str(person_id), record)
+            dedup_key = entry["asset_id"] or entry["path"] or f"{style_label}:{person_id}"
+            if dedup_key in seen_people:
+                continue
+            seen_people.add(dedup_key)
+            people_entries.append(entry)
+        scenes = cache.get("scenes") if isinstance(cache.get("scenes"), dict) else {}
+        for place_id, record in (scenes.get("by_id") or {}).items():
+            if not isinstance(record, dict):
+                continue
+            entry = _scene_library_entry(style_label, str(place_id), record)
+            dedup_key = entry["path"] or f"{style_label}:{place_id}"
+            if dedup_key in seen_scenes:
+                continue
+            seen_scenes.add(dedup_key)
+            scene_entries.append(entry)
+
+    for style, cache in sorted(_read_asset_library_styles().items()):
+        if wanted is None or style in wanted:
+            add_cache(style, cache)
+
+    if job is not None:
+        try:
+            job_cache = _load_auto_asset_cache(job)
+        except Exception:  # noqa: BLE001 - viewing must never break on a bad cache
+            job_cache = None
+        if isinstance(job_cache, dict):
+            job_style = _normalize_auto_asset_style((job.manifest.get("auto_asset_options") or {}).get("visual_style"))
+            add_cache(f"{job_style}·当前任务", job_cache)
+
+    entries = people_entries + scene_entries
+    summary = {
+        "styles": sorted({entry["style"] for entry in entries}),
+        "total": len(entries),
+        "people": len(people_entries),
+        "scenes": len(scene_entries),
+        "registered_volcano_assets": sum(1 for entry in people_entries if entry["registered"]),
+        "library_path": str(_auto_asset_library_path()),
+    }
+    return {"summary": summary, "people": people_entries, "scenes": scene_entries, "entries": entries}
+
+
+def _asset_inventory_grid(entries: list[dict[str, Any]], *, columns: int = 3) -> torch.Tensor:
+    columns = max(1, min(6, int(columns)))
+    display = [entry for entry in entries if entry.get("has_image") and _asset_path_if_file(entry.get("path"))]
+    if not display:
+        canvas = Image.new("RGB", (760, 200), "#202124")
+        draw = ImageDraw.Draw(canvas)
+        draw.text(
+            (24, 84),
+            "暂无入库资源：尚未有已保存的人物或场景素材。",
+            fill="#ffffff",
+            font=ImageFont.load_default(size=26),
+        )
+        value = np.asarray(canvas, dtype=np.float32) / 255.0
+        return torch.from_numpy(value)[None,]
+
+    cols = min(columns, len(display))
+    rows = int(math.ceil(len(display) / cols))
+    cell_w = ASSET_LIBRARY_GRID_CELL
+    cell_h = ASSET_LIBRARY_GRID_CELL + ASSET_LIBRARY_GRID_LABEL_HEIGHT
+    canvas = Image.new("RGB", (cell_w * cols, cell_h * rows), "#15171a")
+    draw = ImageDraw.Draw(canvas)
+    title_font = ImageFont.load_default(size=22)
+    detail_font = ImageFont.load_default(size=18)
+    image_box = ASSET_LIBRARY_GRID_CELL - 16
+    for position, entry in enumerate(display):
+        cell_x = (position % cols) * cell_w
+        cell_y = (position // cols) * cell_h
+        path = _asset_path_if_file(entry.get("path"))
+        try:
+            with Image.open(path) as source:
+                source = source.convert("RGB")
+                source.thumbnail((image_box, image_box), Image.Resampling.LANCZOS)
+                canvas.paste(
+                    source,
+                    (
+                        cell_x + (cell_w - source.width) // 2,
+                        cell_y + 8 + (image_box - source.height) // 2,
+                    ),
+                )
+        except Exception:  # noqa: BLE001 - a broken thumbnail must not abort the whole grid
+            draw.rectangle(
+                (cell_x + 8, cell_y + 8, cell_x + cell_w - 8, cell_y + ASSET_LIBRARY_GRID_CELL - 8),
+                outline="#5f6368",
+                width=2,
+            )
+        label_top = cell_y + ASSET_LIBRARY_GRID_CELL
+        draw.rectangle((cell_x, label_top, cell_x + cell_w - 1, cell_y + cell_h - 1), fill="#0f1113")
+        if entry.get("registered"):
+            badge, color = "已入库", "#34a853"
+        elif entry["type"] == "scene":
+            badge, color = "场景", "#8ab4f8"
+        else:
+            badge, color = "本地", "#fbbc04"
+        draw.text((cell_x + 10, label_top + 8), f"[{badge}] {str(entry['id'])[:26]}", fill=color, font=title_font)
+        detail = entry.get("asset_id") or str(entry.get("appearance") or entry.get("description") or "")
+        draw.text(
+            (cell_x + 10, label_top + 40),
+            f"{entry.get('style', '')} · {detail[:30]}",
+            fill="#e8eaed",
+            font=detail_font,
+        )
+    value = np.asarray(canvas, dtype=np.float32) / 255.0
+    return torch.from_numpy(value)[None,]
+
+
+def build_asset_library_view(
+    visual_style: str = "",
+    columns: int = 3,
+    *,
+    job: LongVideoJob | None = None,
+) -> tuple[torch.Tensor, str, str]:
+    inventory = collect_registered_asset_inventory(visual_style, job=job)
+    grid = _asset_inventory_grid(inventory["entries"], columns=columns)
+    report = json.dumps(inventory, ensure_ascii=False, indent=2)
+    summary_data = inventory["summary"]
+    summary = (
+        f"入库资源共 {summary_data['total']} 项：人物 {summary_data['people']}、场景 {summary_data['scenes']}，"
+        f"其中已注册火山素材 {summary_data['registered_volcano_assets']} 个。"
+        f"样式：{'、'.join(summary_data['styles']) or '无'}"
+    )
+    return grid, report, summary
 
 
 def _source_frames_for_task(job: LongVideoJob, task: dict[str, Any]) -> torch.Tensor:
@@ -2262,8 +3058,9 @@ def _auto_asset_analysis(frames: torch.Tensor, *, model: str) -> dict[str, Any]:
     )
     request = (
         "根据首、中、尾帧判断镜头是否稳定。若首尾明显跨场景，shot_stability 使用 transition；"
-        "若主要人物超过三人，使用 crowded。identity_key 只能基于可见服装、发型、年龄感、道具和媒介特征，"
-        "不能使用真实姓名。reuse_confidence 只有在画面特征足以和后续镜头核验时才给高值。"
+        "若主要人物超过三人，使用 crowded。identity_key 必须优先描述可见的脸部轮廓、年龄感、体型、性别表达、"
+        "稳定发型等可跨镜头识别的特征；服装和道具只能作为辅助，不能使用真实姓名。"
+        "reuse_confidence 只表示本镜头的可见信息完整度，不能阻止后续素材库核验。"
     )
     raw = generate_openai_image_prompt_text(
         _get_config("gpttext"),
@@ -2346,6 +3143,52 @@ def _generate_auto_asset_image(
 def _provider_policy_error(value: Any) -> bool:
     text = str(value or "").lower()
     return any(marker in text for marker in ("inputimagesensitivecontent", "sensitive content", "content policy", "moderation"))
+
+
+class AnalysisGatewayUnavailableError(RuntimeError):
+    """Raised before asset production when the configured analysis gateway is unusable."""
+
+
+def _analysis_error_is_recoverable(value: Any) -> bool:
+    """Return whether an analysis failure can reasonably succeed on a short retry."""
+    text = str(value or "").lower()
+    if _provider_policy_error(text):
+        return False
+    status_match = re.search(r"\bhttp\s+(\d{3})\b", text)
+    if status_match:
+        status = int(status_match.group(1))
+        return status in {408, 429} or 500 <= status <= 599
+    nonrecoverable_markers = (
+        "authentication",
+        "unauthorized",
+        "forbidden",
+        "invalid api key",
+        "invalid model",
+        "model not found",
+        "bad request",
+        "validation error",
+        "config must",
+        "not found: gpttext",
+    )
+    if any(marker in text for marker in nonrecoverable_markers):
+        return False
+    recoverable_markers = (
+        "connection refused",
+        "winerror 10061",
+        "max retries exceeded",
+        "connecttimeout",
+        "readtimeout",
+        "timed out",
+        "timeout",
+        "temporary",
+        "eof",
+        "connection reset",
+        "connection aborted",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+    )
+    return any(marker in text for marker in recoverable_markers)
 
 
 def _real_person_privacy_error(value: Any) -> bool:
@@ -2508,8 +3351,9 @@ def _verify_auto_asset_cache(
         )
         request = (
             "第一张是当前镜头的人物原始裁剪，第二张是素材库保存的人物原始裁剪。"
-            "只依据可见特征判断是否同一人物且外观严格一致。发型、服装结构/颜色、体型/年龄感、"
-            "关键道具或显著配饰任一冲突都必须判为 different；信息不足判为 uncertain。"
+            "判断是否是同一位会在多个镜头反复出现的叙事人物。优先比较脸部轮廓和五官、年龄感、体型、"
+            "性别表达、稳定发型等身份特征；允许机位、表情、姿势、光线、背景和服装变化。"
+            "只有脸部/体型/年龄等稳定身份特征明显冲突时才判为 different；脸不可见或证据不足时判为 uncertain。"
             f"当前特征：{current_features}。候选特征：{candidate_features}。"
             f"只输出合法 JSON：{output_contract}。"
         )
@@ -2552,6 +3396,10 @@ def _auto_asset_preview(job: LongVideoJob) -> torch.Tensor:
             if path.is_file():
                 paths.append(path)
         for item in assets.get("scenes", []):
+            path = Path(str(item.get("path", "")))
+            if path.is_file():
+                paths.append(path)
+        for item in assets.get("integrated_frames", []):
             path = Path(str(item.get("path", "")))
             if path.is_file():
                 paths.append(path)
@@ -2629,11 +3477,11 @@ def _person_asset_prompt(
             f"人物可见特征：{person['appearance']}。"
         )
     return (
-        "将参考图中的同一位人物整体重设计为符合当代欧美审美的外国人物，而不是只更换面孔。"
-        "保留可识别的性别、年龄段、人物关系、体型、核心身份功能和原始视觉媒介，"
-        "同时统一调整面部地域特征、发型发色、妆容、服装鞋履、配饰、版型剪裁、材质配色、姿态和人物气质。"
-        "清除本土东方服饰结构、纹样和造型残留，使人物自然、自信、松弛且文化风格统一。"
-        "若原图是动漫、漫画、插画或 CG，保持该媒介并改为欧美版本；若是真人，保持高质量欧美真人影视质感。"
+        "为后续镜头建立可复用的欧美人物替换母版。用一位符合当代欧美审美的外国人物，"
+        "替换参考图中的原人物，而不是只改脸或轻微调色。保留性别、年龄段、体型、人物关系和剧情身份功能，"
+        "但人物的面部地域特征、发型发色、妆容、服装鞋履、配饰、版型剪裁、材质配色和整体气质可以发生明显变化。"
+        "必须清除中式/东方服饰结构、纹样和本土造型残留，使替换后人物自然且文化风格统一。"
+        "若原图是动漫、漫画、插画或 CG，保持媒介并替换为欧美版本；若是真人，使用高质量欧美真人影视质感。"
         "使用干净、与服装颜色明显区分的纯色色键背景，画面中仅保留完整单人，不添加其他人物或肢体。"
         f"人物可见特征：{person['appearance']}。"
     )
@@ -2689,13 +3537,186 @@ def _scene_asset_prompt(
             f"这是镜头{position}的场景，画面描述：{description}。"
         )
     return (
-        "以参考图中的完整环境为基础，移除所有人物、人体残留、倒影和人物投影，并自然补全被遮挡区域。"
-        "保留原镜头的基本叙事用途、时间氛围、光线方向、机位和画幅关系，"
-        "但要彻底重构为真实可信、地域统一的欧美国家场景，而不是轻微调色或只替换少量道具。"
-        "根据画面情境选择明确的北美或欧洲地域逻辑，统一重设计建筑语言、空间与道路结构、公共设施、"
-        "家具陈设、材质、植被、照明和生活细节，并清除中式建筑、家具、纹样、中文招牌及本土化视觉符号。"
-        "保持输入图的原始视觉媒介和合理透视；不得出现人物、人体残留、可辨识文字、乱码、Logo、水印或拼贴边缘。"
+        "为后续镜头建立可复用的欧美场景替换母版。移除参考图中的所有人物、人体残留、倒影和人物投影，"
+        "用完整、可信、地域统一的北美或欧洲环境替换原建筑、道路、公共设施、家具陈设、材质、植被、照明和生活细节。"
+        "不要轻微调色或只换少量道具；允许环境外观发生明显变化。只保留镜头的画幅、机位、景别、透视、"
+        "人物可活动空间、基本叙事用途和光线方向，以便后续镜头能沿用同一个替换场景。"
+        "必须清除中式建筑、家具、纹样、中文招牌及本土化视觉符号。保持输入图的原始视觉媒介和合理透视；"
+        "不得出现人物、人体残留、可辨识文字、乱码、Logo、水印或拼贴边缘。"
         f"这是镜头{position}的场景，画面描述：{description}。"
+    )
+
+
+def _integrated_frame_prompt(
+    analysis: dict[str, Any],
+    *,
+    role: str,
+    person_master_count: int,
+    has_scene_master: bool,
+    has_style_master: bool,
+    visual_style: str,
+    style_prompt: str,
+    retry_reasons: list[str] | None = None,
+) -> str:
+    style = _normalize_auto_asset_style(visual_style)
+    style_targets = {
+        AUTO_ASSET_STYLE_ANIME: "统一、明确的高质量二维动漫造型、线稿、上色和光影",
+        AUTO_ASSET_STYLE_PHOTOREAL: "统一的高质量真人影视摄影、真实材质和自然电影光影",
+        AUTO_ASSET_STYLE_CG_3D: "统一的高质量 3D 游戏 CG、PBR 材质和影视级体积光",
+        AUTO_ASSET_STYLE_COMIC: "统一的高质量漫画插画、手绘墨线、块面和插画上色",
+        AUTO_ASSET_STYLE_CUSTOM: str(style_prompt or "用户指定的目标视觉风格").strip(),
+        AUTO_ASSET_STYLE_WESTERN: (
+            "彻底、明显的欧美化影视视觉：人物整体造型、服装、发型与气质，以及建筑、材质、陈设和地域语言"
+        ),
+    }
+    references: list[str] = [
+        "图片 1 是当前镜头原始整帧，只负责构图、机位、景别、动作、人物数量、空间关系和叙事物体位置，"
+        "不提供人物身份、服装、建筑、地域、材质或视觉风格约束"
+    ]
+    next_index = 2
+    if person_master_count:
+        end = next_index + person_master_count - 1
+        references.append(
+            f"图片 {next_index}" + (f" 至图片 {end}" if end > next_index else "") +
+            " 是人物替换母版，只负责对应人物的欧美身份、脸、发型、服装、配饰和整体造型"
+        )
+        next_index = end + 1
+    if has_scene_master:
+        references.append(f"图片 {next_index} 是场景替换母版，只负责欧美环境、建筑设计、材质和色彩")
+        next_index += 1
+    if has_style_master:
+        references.append(
+            f"图片 {next_index} 是全局强风格母版，只迁移风格强度和视觉语言，严禁复制其中的人物、建筑布局或构图"
+        )
+    failure_instruction = ""
+    if retry_reasons:
+        failure_instruction = (
+            "上一版因以下问题未通过验收，本次必须逐项修正："
+            + "；".join(str(item) for item in retry_reasons if str(item).strip())
+            + "。"
+        )
+    position = "开始" if role == "frame_start" else "结束"
+    people = "；".join(str(item.get("appearance") or "主要人物") for item in analysis.get("people", []))
+    background = analysis.get("background") if isinstance(analysis.get("background"), dict) else {}
+    scene_description = background.get("first_description") if role == "frame_start" else background.get("last_description")
+    return (
+        "执行多图整帧替换。" + "；".join(references) + "。"
+        f"输出必须保持图片 1 的完整画幅、{position}帧构图、透视、景别、人物数量、人物站位、动作状态和叙事物体，"
+        "把人物与背景一次性替换为完整画面，不能输出人物抠图、空背景、拼图、设定图或局部裁剪。"
+        f"目标风格：{style_targets[style]}。"
+        "不得只做调色。人物和环境与图片 1 明显不同是预期结果；不得保留与目标风格冲突的服装、建筑、材质、纹样或摄影质感；"
+        "不得新增、删除、复制、融合人物，不得把母版中的人物或场景布局搬到当前镜头。"
+        f"当前人物：{people or '按原整帧中的实际人物数量与外观处理'}。"
+        f"当前场景：{str(scene_description or '只保持当前镜头的空间关系和叙事用途')}。"
+        f"{failure_instruction}只输出一张完成后的整帧画面，不要文字、水印、边框或说明。"
+    )
+
+
+def _score01(value: Any) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _normalize_integrated_frame_quality(
+    value: Any,
+    *,
+    require_person_identity: bool,
+) -> dict[str, Any]:
+    result = value if isinstance(value, dict) else {}
+    target_style = _score01(result.get("target_style_score"))
+    source_residue = _score01(result.get("source_style_residue"))
+    composition = _score01(result.get("composition_preservation"))
+    person_identity = _score01(result.get("person_identity_score")) if require_person_identity else 1.0
+    scene_replacement = _score01(result.get("scene_replacement_score", result.get("scene_identity_score")))
+    person_count_match = bool(result.get("person_count_match"))
+    reasons = _as_string_list(result.get("reasons"))
+    failed: list[str] = []
+    if target_style < AUTO_ASSET_TARGET_STYLE_THRESHOLD:
+        failed.append(f"目标风格强度不足（{target_style:.2f}）")
+    if source_residue > AUTO_ASSET_SOURCE_RESIDUE_THRESHOLD:
+        failed.append(f"原风格残留过多（{source_residue:.2f}）")
+    if composition < AUTO_ASSET_COMPOSITION_THRESHOLD:
+        failed.append(f"构图保留不足（{composition:.2f}）")
+    if not person_count_match:
+        failed.append("人物数量与源帧不一致")
+    if require_person_identity and person_identity < AUTO_ASSET_PERSON_IDENTITY_THRESHOLD:
+        failed.append(f"人物身份一致性不足（{person_identity:.2f}）")
+    if scene_replacement < AUTO_ASSET_SCENE_REPLACEMENT_THRESHOLD:
+        failed.append(f"场景替换或空间关系不合格（{scene_replacement:.2f}）")
+    for item in failed:
+        if item not in reasons:
+            reasons.append(item)
+    return {
+        "version": AUTO_ASSET_QUALITY_GATE_VERSION,
+        "target_style_score": target_style,
+        "source_style_residue": source_residue,
+        "composition_preservation": composition,
+        "person_count_match": person_count_match,
+        "person_identity_score": person_identity,
+        "scene_replacement_score": scene_replacement,
+        "verdict": "approved" if not failed else "retry",
+        "reasons": reasons,
+        "thresholds": {
+            "target_style_score": AUTO_ASSET_TARGET_STYLE_THRESHOLD,
+            "source_style_residue": AUTO_ASSET_SOURCE_RESIDUE_THRESHOLD,
+            "composition_preservation": AUTO_ASSET_COMPOSITION_THRESHOLD,
+            "person_identity_score": AUTO_ASSET_PERSON_IDENTITY_THRESHOLD,
+            "scene_replacement_score": AUTO_ASSET_SCENE_REPLACEMENT_THRESHOLD,
+        },
+    }
+
+
+def _evaluate_integrated_frame_quality(
+    *,
+    source_frame: Any,
+    candidate: Any,
+    person_masters: list[Any],
+    scene_master: Any | None,
+    style_master: Any | None,
+    analysis: dict[str, Any],
+    model: str,
+    visual_style: str,
+    style_prompt: str,
+) -> dict[str, Any]:
+    images = [source_frame, candidate]
+    labels = ["图片1=当前源整帧", "图片2=候选整帧替换结果"]
+    for person in person_masters:
+        images.append(person)
+        labels.append(f"图片{len(images)}=人物替换母版")
+    if scene_master is not None:
+        images.append(scene_master)
+        labels.append(f"图片{len(images)}=场景替换母版")
+    if style_master is not None:
+        images.append(style_master)
+        labels.append(f"图片{len(images)}=全局强风格母版")
+    output_contract = (
+        '{"target_style_score":0-1,"source_style_residue":0-1,'
+        '"composition_preservation":0-1,"person_count_match":true|false,'
+        '"person_identity_score":0-1,"scene_replacement_score":0-1,"reasons":[]}'
+    )
+    request = (
+        f"输入顺序：{'；'.join(labels)}。"
+        "严格比较图片2是否保留图片1的构图、机位、景别、人物数量、动作、空间关系和叙事物体，"
+        "并是否用人物/场景替换母版完成明显的目标替换。不要因为人物长相、服装、建筑或环境与图片1不同而扣分，"
+        "这种改变正是目标。若仍接近源图、只调色、人物数量变化、身份未遵循人物母版、环境未遵循场景母版、"
+        "空间关系丢失或复制了母版构图，必须降低对应分数。"
+        f"目标风格类型：{_normalize_auto_asset_style(visual_style)}；目标说明：{str(style_prompt or '')[:1200]}。"
+        f"镜头分析：{json.dumps(analysis, ensure_ascii=False)[:1800]}。只输出合法 JSON：{output_contract}。"
+    )
+    raw = generate_openai_image_prompt_text(
+        _get_config("gpttext"),
+        skill="你是严格的整帧替换验收器。宁可要求再次生成，也不能让弱替换、身份错误或空间关系错误进入视频参考包。",
+        modification_target=request,
+        image=_vision_batch(images),
+        model=model,
+        temperature=0.0,
+        max_tokens=700,
+    )
+    return _normalize_integrated_frame_quality(
+        _extract_json_object(raw),
+        require_person_identity=bool(person_masters),
     )
 
 
@@ -3054,11 +4075,12 @@ def _build_auto_asset_video_prompt(
     soft_continuity: bool,
     visual_style: str = AUTO_ASSET_STYLE_WESTERN,
     send_source_video: bool = True,
+    reference_timeline: list[dict[str, Any]] | None = None,
 ) -> str:
     continuity = (
         "上一段末帧是动作与空间连续性的软参考；优先保持本段剧情和镜头逻辑。"
         if soft_continuity
-        else "本段是首段，不需要引用上一段的末帧。"
+        else "本段按独立镜头生成，不引用上一段的末帧。"
     )
     people = "; ".join(item.get("appearance", "主要人物") for item in analysis.get("people", [])) or "按原视频实际人物处理"
     style = _normalize_auto_asset_style(visual_style)
@@ -3123,17 +4145,43 @@ def _build_auto_asset_video_prompt(
             else "未向视频模型提供原分镜视频；只能依据本段剧情分析文字重新演绎动作和镜头。"
         )
         style_instruction = (
-            "参考图片分别定义最终人物和环境的唯一欧美视觉身份，不得混用："
+            "参考图片分别定义用于替换原人物和原环境的唯一欧美视觉身份，不得混用："
             "人物必须保持参考图中整体欧美化后的面孔、发型、妆容、服装、鞋履、配饰和气质，不能只换脸或恢复原造型；"
             "完整背景必须保持参考图中地域统一的欧美建筑、道路、家具、材质、植被、照明和生活细节，"
-            "不能恢复原背景或退化为轻微调色。保持参考图原有视觉媒介，真人保持欧美真人电影质感，"
+            "不能恢复原背景或退化为轻微调色。人物和环境可以与原视频显著不同，但必须保留原镜头的人物数量、"
+            "动作、空间关系、叙事物体和镜头运动。保持参考图原有视觉媒介，真人保持欧美真人电影质感，"
             "动漫、漫画或 CG 保持同一媒介的欧美版本；从第一帧到最后一帧维持人物身份、整体造型、环境和光影稳定。"
         )
+    timeline_lines: list[str] = []
+    for fallback_index, item in enumerate(reference_timeline or [], start=1):
+        image_index = int(item.get("image_index") or fallback_index)
+        ranges = item.get("ranges") if isinstance(item.get("ranges"), list) else []
+        range_text = "、".join(
+            f"{float(value.get('start', 0.0)):.2f}-{float(value.get('end', 0.0)):.2f} 秒"
+            for value in ranges
+            if isinstance(value, dict)
+        )
+        if range_text:
+            timeline_lines.append(
+                f"{range_text}以图片 {image_index} 定义该时间范围的人物、场景、构图和目标视觉；"
+            )
+    timeline_instruction = ""
+    if timeline_lines:
+        timeline_instruction = (
+            "参考图片按 content 中的实际顺序编号，时间映射如下：\n"
+            + "\n".join(timeline_lines)
+            + "\n这些时间范围属于同一次连续生成请求，不得理解为视频切段或额外转场。\n"
+        )
+    role_instruction = (
+        f"自动参考图角色顺序：{', '.join(reference_roles) or '无额外参考图'}。\n"
+        if not timeline_lines
+        else ""
+    )
     return (
         f"{str(base_prompt or '').strip()}\n\n"
         f"本段原视频规定剧情、动作、镜头运动、表演节奏和时间过程：{analysis.get('story_action', '')}\n"
         f"自动识别的主要人物：{people}\n"
-        f"自动参考图角色顺序：{', '.join(reference_roles) or '无额外参考图'}。\n"
+        f"{role_instruction}{timeline_instruction}"
         f"{style_instruction}{source_instruction}"
         "保持原视频实际人物数量、人物关系和场景变化，不增加、删除、复制或融合人物。"
         "允许人物动作、表情和镜头内互动自然演绎，但画面必须符合真实的身体结构、空间关系和叙事因果。\n"
@@ -3216,6 +4264,27 @@ def _save_person_source_observations(images: list[Any], root: Path, slot: str) -
     return paths, normalized
 
 
+def _person_master_resolution(paths: list[str]) -> dict[str, Any]:
+    widths: list[int] = []
+    heights: list[int] = []
+    for value in paths:
+        path = _asset_path_if_file(value)
+        if path is None:
+            continue
+        with Image.open(path) as image:
+            widths.append(int(image.width))
+            heights.append(int(image.height))
+    width = max(widths, default=0)
+    height = max(heights, default=0)
+    eligible = min(width, height) >= AUTO_ASSET_MIN_PERSON_MASTER_EDGE and width * height >= AUTO_ASSET_MIN_PERSON_MASTER_AREA
+    return {
+        "width": width,
+        "height": height,
+        "eligible_for_identity_master": eligible,
+        "reason": "" if eligible else f"人物源裁剪仅 {width}x{height}，不足以作为可靠身份母版。",
+    }
+
+
 def _legacy_auto_asset_suspicions(cache: dict[str, Any], category: str, hint: str) -> list[dict[str, Any]]:
     legacy_group = cache.get("legacy", {}).get("people" if category == "person" else "scenes", {})
     candidate = legacy_group.get(hint) if isinstance(legacy_group, dict) else None
@@ -3233,6 +4302,26 @@ def _legacy_auto_asset_suspicions(cache: dict[str, Any], category: str, hint: st
     ]
 
 
+def _uncertain_match_needs_review(verdict: dict[str, Any]) -> bool:
+    """Whether an ``uncertain`` cache comparison is a genuine identity ambiguity.
+
+    Only a comparison that had usable evidence on both sides and still landed in the
+    middle should hold up the paid pipeline for human review. A verdict is uncertain
+    for two non-signal reasons that must NOT block: the candidate frame has no
+    comparable subject (``missing_fields`` populated), or the request failed and the
+    verifier fabricated an uncertain result (confidence at/under the different floor).
+    """
+    if str(verdict.get("decision") or "") != "uncertain":
+        return False
+    if _as_string_list(verdict.get("missing_fields")):
+        return False
+    try:
+        confidence = float(verdict.get("confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return confidence > AUTO_ASSET_DIFFERENT_THRESHOLD
+
+
 def _find_person_cache_match(
     cache: dict[str, Any],
     *,
@@ -3240,7 +4329,7 @@ def _find_person_cache_match(
     source_image: Any,
     model: str,
     reuse_threshold: float,
-) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]], bool]:
     people = cache.get("people", {})
     by_id = people.get("by_id") if isinstance(people, dict) else {}
     by_id = by_id if isinstance(by_id, dict) else {}
@@ -3248,6 +4337,7 @@ def _find_person_cache_match(
     index = index if isinstance(index, dict) else {}
     identity_key = str(person.get("identity_key") or "")
     suspected = _legacy_auto_asset_suspicions(cache, "person", identity_key)
+    uncertain_candidate_found = False
     for person_id in _candidate_ids(index, identity_key, by_id):
         candidate = by_id.get(person_id)
         if not isinstance(candidate, dict):
@@ -3277,8 +4367,11 @@ def _find_person_cache_match(
         )
         decision = str(verdict.get("decision") or "uncertain")
         if decision == "same":
-            return candidate, suspected
+            return candidate, suspected, True
         if decision == "uncertain":
+            needs_review = _uncertain_match_needs_review(verdict)
+            if needs_review:
+                uncertain_candidate_found = True
             suspected.append(
                 {
                     "category": "person",
@@ -3288,9 +4381,10 @@ def _find_person_cache_match(
                     "reason": "; ".join(verdict.get("reasons", [])) or "人物相似但不足以自动复用。",
                     "hard_mismatches": verdict.get("hard_mismatches", []),
                     "missing_fields": verdict.get("missing_fields", []),
+                    "needs_review": needs_review,
                 }
             )
-    return None, suspected
+    return None, suspected, uncertain_candidate_found
 
 
 def _find_scene_cache_match(
@@ -3342,7 +4436,9 @@ def _find_scene_cache_match(
             )
             decision = str(verdict.get("decision") or "uncertain")
             if decision == "same":
-                return version, place_id, suspected
+                matched = dict(version)
+                matched["place_id"] = place_id
+                return matched, place_id, suspected
             if decision == "same_place_new_version":
                 matched_place_id = place_id
                 continue
@@ -3361,6 +4457,36 @@ def _find_scene_cache_match(
     return None, matched_place_id, suspected
 
 
+def _scene_cache_place(cache: dict[str, Any], place_id: str) -> dict[str, Any] | None:
+    scenes = cache.get("scenes") if isinstance(cache.get("scenes"), dict) else {}
+    places = scenes.get("by_id") if isinstance(scenes.get("by_id"), dict) else {}
+    value = places.get(str(place_id or ""))
+    return value if isinstance(value, dict) else None
+
+
+def _scene_cache_version(cache: dict[str, Any], place_id: str, view_id: str) -> dict[str, Any] | None:
+    place = _scene_cache_place(cache, place_id)
+    versions = place.get("versions") if isinstance(place, dict) and isinstance(place.get("versions"), dict) else {}
+    value = versions.get(str(view_id or ""))
+    return value if isinstance(value, dict) else None
+
+
+def _scene_style_master_path(cache: dict[str, Any], place_id: str) -> Path | None:
+    place = _scene_cache_place(cache, place_id)
+    if not isinstance(place, dict):
+        return None
+    direct = _asset_path_if_file(place.get("style_master_path"))
+    if direct is not None:
+        return direct
+    versions = place.get("versions") if isinstance(place.get("versions"), dict) else {}
+    for version in versions.values():
+        if isinstance(version, dict):
+            path = _asset_path_if_file(version.get("converted_path"))
+            if path is not None:
+                return path
+    return None
+
+
 def _write_auto_asset_manifest(root: Path, task: dict[str, Any]) -> None:
     assets = task.get("auto_assets", {})
     _atomic_write_json(
@@ -3372,8 +4498,10 @@ def _write_auto_asset_manifest(root: Path, task: dict[str, Any]) -> None:
             "source_duration": task.get("source_duration"),
             "status": task.get("auto_asset_status"),
             "analysis": task.get("auto_asset_analysis"),
+            "analysis_attempts": int(task.get("auto_asset_analysis_attempts") or 0),
             "assets": assets,
             "errors": task.get("auto_asset_errors", []),
+            "warnings": task.get("auto_asset_warnings", []),
         },
     )
 
@@ -3385,14 +4513,66 @@ def _valid_auto_asset_entries(assets: dict[str, Any], category: str, key: str) -
         if not isinstance(item, dict):
             continue
         identifier = str(item.get(key) or "")
-        if identifier and _asset_path_if_file(item.get("path")):
+        if identifier and (_asset_path_if_file(item.get("path")) or _active_person_asset_id(item)):
             entries[identifier] = item
     return entries
 
 
-def _auto_asset_task_complete(task: dict[str, Any], root: Path, *, reuse_threshold: float) -> bool:
+def _approved_integrated_frames(assets: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    approved: dict[str, dict[str, Any]] = {}
+    values = assets.get("integrated_frames", []) if isinstance(assets, dict) else []
+    for item in values if isinstance(values, list) else []:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "")
+        quality = item.get("quality") if isinstance(item.get("quality"), dict) else {}
+        if role and quality.get("verdict") == "approved" and _asset_path_if_file(item.get("path")):
+            approved[role] = item
+    return approved
+
+
+def _auto_asset_task_complete(
+    task: dict[str, Any],
+    root: Path,
+    *,
+    reuse_threshold: float,
+    require_integrated_frames: bool = False,
+) -> bool:
     if task.get("auto_asset_status") != "ready" or task.get("auto_asset_errors"):
         return False
+    if not _auto_asset_task_masters_complete(task, root, reuse_threshold=reuse_threshold):
+        return False
+    if not require_integrated_frames:
+        return True
+    assets = task.get("auto_assets")
+    integrated = _approved_integrated_frames(assets)
+    expected_scenes = _auto_asset_expected_scene_roles(task, reuse_threshold=reuse_threshold)
+    expected_frames = ["frame_start"]
+    if len(expected_scenes) > 1:
+        expected_frames.append("frame_end")
+    return all(role in integrated for role in expected_frames)
+
+
+def _auto_asset_expected_scene_roles(task: dict[str, Any], *, reuse_threshold: float) -> list[str]:
+    analysis = task.get("auto_asset_analysis")
+    assets = task.get("auto_assets")
+    if not isinstance(analysis, dict):
+        return ["scene_start"]
+    background = analysis.get("background") if isinstance(analysis.get("background"), dict) else {}
+    if (
+        analysis.get("shot_stability") in {"transition", "uncertain"}
+        or float(background.get("same_scene_confidence", 0.0)) < reuse_threshold
+    ):
+        return ["scene_start", "scene_end"]
+    return ["scene_start"]
+
+
+def _auto_asset_task_masters_complete(
+    task: dict[str, Any],
+    root: Path,
+    *,
+    reuse_threshold: float,
+) -> bool:
     analysis = task.get("auto_asset_analysis")
     assets = task.get("auto_assets")
     if not isinstance(analysis, dict) or not isinstance(assets, dict) or not (root / "manifest.json").is_file():
@@ -3400,19 +4580,22 @@ def _auto_asset_task_complete(task: dict[str, Any], root: Path, *, reuse_thresho
     if not _saved_source_frame_paths(root, assets):
         return False
     people = _valid_auto_asset_entries(assets, "people", "slot")
+    ignored_people = {
+        str(item.get("slot") or "")
+        for item in assets.get("people", []) if isinstance(assets.get("people"), list)
+        if isinstance(item, dict) and str(item.get("identity_state") or "") in {"partial", "ignored"}
+    }
     scenes = _valid_auto_asset_entries(assets, "scenes", "role")
     expected_people = [] if analysis.get("shot_stability") == "crowded" else [
         str(item.get("slot") or "")
         for item in analysis.get("people", [])
-        if isinstance(item, dict) and item.get("slot")
+        if (
+            isinstance(item, dict)
+            and item.get("slot")
+            and str(item.get("slot") or "") not in ignored_people
+        )
     ]
-    background = analysis.get("background") if isinstance(analysis.get("background"), dict) else {}
-    expected_scenes = ["scene_start"]
-    if (
-        analysis.get("shot_stability") in {"transition", "uncertain"}
-        or float(background.get("same_scene_confidence", 0.0)) < reuse_threshold
-    ):
-        expected_scenes.append("scene_end")
+    expected_scenes = _auto_asset_expected_scene_roles(task, reuse_threshold=reuse_threshold)
     return all(slot in people for slot in expected_people) and all(role in scenes for role in expected_scenes)
 
 
@@ -3428,19 +4611,30 @@ def _checkpoint_auto_asset_task(
     errors: list[dict[str, Any]],
     status: str,
     suspected_matches: list[dict[str, Any]] | None = None,
+    warnings: list[dict[str, Any]] | None = None,
+    integrated_frames: list[dict[str, Any]] | None = None,
 ) -> None:
     if analysis is not None:
         task["auto_asset_analysis"] = analysis
+    previous_assets = task.get("auto_assets") if isinstance(task.get("auto_assets"), dict) else {}
+    if integrated_frames is None:
+        integrated_frames = [
+            dict(item)
+            for item in previous_assets.get("integrated_frames", [])
+            if isinstance(item, dict)
+        ]
     task["auto_assets"] = {
         "prompt_version": AUTO_ASSET_PROMPT_VERSION,
         "cache_version": AUTO_ASSET_CACHE_VERSION,
         "source_frames": source_frames,
         "people": people,
         "scenes": scenes,
+        "integrated_frames": integrated_frames,
         "suspected_matches": suspected_matches or [],
     }
     task["auto_asset_suspected_matches"] = suspected_matches or []
     task["auto_asset_errors"] = errors
+    task["auto_asset_warnings"] = warnings or []
     task["auto_asset_status"] = status
     _write_auto_asset_manifest(root, task)
     _atomic_write_json(job.manifest_path, job.manifest)
@@ -3481,6 +4675,27 @@ def _send_auto_asset_progress_event(payload: dict[str, Any]) -> None:
             send_sync(AUTO_ASSET_PROGRESS_EVENT, payload, client_id)
     except Exception:
         logging.debug("Unable to send auto asset progress event.", exc_info=True)
+
+
+_LOCAL_EVENT_PATH_PATTERN = re.compile(
+    r"(?i)(?:[a-z]:[\\/]|/(?:mnt|home|tmp|var|private|users|workspace|output)/)[^\s\"'`，,;；:：]+"
+)
+
+
+def _public_auto_asset_progress_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Strip local-only fields before a progress event leaves the backend."""
+    private_keys = {"manifest", "progress_path", "path", "source_path", "result"}
+
+    def sanitize(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: sanitize(item) for key, item in value.items() if key not in private_keys}
+        if isinstance(value, list):
+            return [sanitize(item) for item in value]
+        if isinstance(value, str):
+            return _LOCAL_EVENT_PATH_PATTERN.sub("[本机路径]", value)
+        return value
+
+    return sanitize(payload)
 
 
 def _emit_auto_asset_progress(
@@ -3525,13 +4740,18 @@ def _emit_auto_asset_progress(
         )
     if extra:
         payload["extra"] = extra
+        preview = extra.get("preview") if isinstance(extra, dict) else None
+        if isinstance(preview, dict):
+            payload["preview"] = preview
 
     job.manifest["auto_asset_progress"] = payload
     try:
         _atomic_write_json(_auto_asset_progress_path(job), payload)
     except Exception:
         logging.warning("Unable to write auto asset progress file.", exc_info=True)
-    _send_auto_asset_progress_event(dict(payload))
+    # The manifest keeps absolute paths for local resume, but WebSocket clients only
+    # receive `/view`-compatible preview descriptors and must not learn those paths.
+    _send_auto_asset_progress_event(_public_auto_asset_progress_payload(payload))
     logging.info("[company_remote] 自动资产进度 %.1f%%：%s", percent, message)
     return payload
 
@@ -3550,6 +4770,157 @@ def _retry_auto_asset_creation(factory: Any, *, max_retries: int) -> tuple[dict[
             break
         time.sleep(min(2.0 * attempt, 6.0))
     return None, last_error
+
+
+def _retry_auto_asset_analysis(
+    factory: Any,
+    *,
+    max_retries: int,
+    on_retry: Any | None = None,
+) -> tuple[dict[str, Any], int]:
+    total_attempts = max(1, int(max_retries) + 1)
+    for attempt in range(1, total_attempts + 1):
+        try:
+            return factory(), attempt
+        except Exception as exc:
+            if attempt >= total_attempts or not _analysis_error_is_recoverable(exc):
+                raise
+            delay = min(float(attempt), 3.0)
+            if on_retry is not None:
+                on_retry(attempt, total_attempts, delay, exc)
+            time.sleep(delay)
+    raise RuntimeError("自动资产分析重试异常结束。")
+
+
+def _local_gateway_health_url(config: Any) -> str:
+    """Return the CLIProxyAPI health endpoint for loopback gpttext configurations."""
+    parsed = urllib.parse.urlsplit(str(config.base_url or ""))
+    if (parsed.hostname or "").lower() not in {"localhost", "127.0.0.1", "::1"}:
+        return ""
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "/healthz", "", ""))
+
+
+def _preflight_auto_asset_analysis_gateway(job: LongVideoJob) -> dict[str, Any]:
+    """Verify that text analysis can run before any asset or video request is submitted."""
+    config = _get_config("gpttext")
+    health_url = _local_gateway_health_url(config)
+    checked_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    preflight = {
+        "status": "checking",
+        "config_name": str(config.name),
+        "model": str(job.ai_model),
+        "health_url": health_url,
+        "checked_at": checked_at,
+    }
+    job.manifest["analysis_gateway_preflight"] = preflight
+    _atomic_write_json(job.manifest_path, job.manifest)
+
+    try:
+        if health_url:
+            session = requests.Session()
+            session.trust_env = False
+            response = session.get(health_url, timeout=ANALYSIS_GATEWAY_HEALTH_TIMEOUT_SECONDS)
+            if not response.ok:
+                raise CompanyRemoteAPIError(f"本机分析网关健康检查失败（HTTP {response.status_code}）。")
+            try:
+                health = response.json()
+            except ValueError as exc:
+                raise CompanyRemoteAPIError("本机分析网关健康检查未返回 JSON。") from exc
+            if not isinstance(health, dict) or str(health.get("status") or "").lower() != "ok":
+                raise CompanyRemoteAPIError("本机分析网关健康检查未返回 status=ok。")
+
+        probe_config = replace(
+            config,
+            timeout_seconds=min(int(config.timeout_seconds), ANALYSIS_GATEWAY_PROBE_TIMEOUT_SECONDS),
+        )
+        probe = generate_openai_chat_text(
+            probe_config,
+            skill="你是连接检测器。只回复 OK。",
+            user_prompt="回复 OK。",
+            model=job.ai_model,
+            temperature=0.0,
+            max_tokens=4,
+        ).strip()
+        if not probe:
+            raise CompanyRemoteAPIError("分析网关探测未返回文本。")
+    except Exception as exc:
+        preflight.update({"status": "failed", "error": str(exc), "checked_at": checked_at})
+        job.manifest["analysis_gateway_preflight"] = preflight
+        _atomic_write_json(job.manifest_path, job.manifest)
+        raise AnalysisGatewayUnavailableError(
+            "自动资产分析服务不可用：请确认 CLIProxyAPI 已在 8317 启动并检查账号授权。"
+        ) from exc
+
+    preflight.update({"status": "ready", "checked_at": checked_at})
+    job.manifest["analysis_gateway_preflight"] = preflight
+    _atomic_write_json(job.manifest_path, job.manifest)
+    return preflight
+
+
+def _mark_analysis_gateway_unavailable(
+    job: LongVideoJob,
+    context: dict[str, Any],
+    error: BaseException,
+) -> None:
+    """Checkpoint a preflight failure without creating failed logical-shot assets."""
+    job.manifest["status"] = "analysis_gateway_unavailable"
+    job.manifest.setdefault("pipeline", {})["error"] = str(error)
+    job.manifest["pipeline"]["failed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    total = max(1, len(_auto_asset_member_tasks(job)))
+    _emit_auto_asset_progress(
+        job,
+        None,
+        value=0,
+        total=total,
+        phase="analysis_gateway_unavailable",
+        message="自动资产分析服务不可用，尚未提交图片或 Seedance 视频请求。",
+        extra={"error": str(error), "image_request_count": 0, "video_request_count": 0},
+    )
+    state = context.get("state")
+    if state is not None:
+        state["status"] = "failed"
+        state["current_batch"]["status"] = "failed"
+        state["current_batch"]["last_error"] = str(error)
+        _manual_batch_write_state(context["state_path"], state)
+    _atomic_write_json(job.manifest_path, job.manifest)
+
+
+def _publish_auto_person_asset(
+    entry: dict[str, Any],
+    *,
+    task_index: int,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Publish one generated person image and return ``(warning, blocking_error)``."""
+    try:
+        path = _asset_path_if_file(entry.get("path"))
+        if path is None:
+            raise ValueError("人物转绘图不存在，不能上传到 TOS。")
+        publication = publish_seedance_person_image(
+            _load_image_file(path),
+            character_label=f"第 {task_index} 段人物 {entry.get('slot') or '未命名'}",
+            reuse_cached=True,
+        )
+    except Exception as exc:
+        entry["publication"] = {
+            "tos": {"status": "failed", "object_key": ""},
+            "asset_library": {"status": "skipped", "asset_id": "", "error": str(exc)},
+        }
+        return None, {
+            "kind": "person",
+            "slot": str(entry.get("slot") or ""),
+            "error_kind": "tos_upload_failed",
+            "message": f"人物转绘图上传 TOS 失败：{exc}",
+        }
+
+    entry["publication"] = publication
+    library = publication.get("asset_library") if isinstance(publication, dict) else {}
+    if str(library.get("status") or "") == "warning":
+        return {
+            "kind": "person_asset_library",
+            "slot": str(entry.get("slot") or ""),
+            "message": str(library.get("error") or "素材库登记未完成。"),
+        }, None
+    return None, None
 
 
 def _merge_auto_asset_cache_entry(cache: dict[str, Any], entry: dict[str, Any]) -> None:
@@ -3586,6 +4957,10 @@ def _merge_auto_asset_cache_entry(cache: dict[str, Any], entry: dict[str, Any]) 
                 identity_keys.append(identity_key)
             _append_candidate_index(cache, "person", identity_key, person_id)
         _append_source_observations(record, update.get("source_observations") or [])
+        if isinstance(entry.get("publication"), dict):
+            record["publication"] = deepcopy(entry["publication"])
+        if isinstance(update.get("publication"), dict):
+            record["publication"] = deepcopy(update["publication"])
         suspected = record.setdefault("suspected_candidates", [])
         if isinstance(suspected, list):
             suspected.extend(item for item in update.get("suspected_candidates", []) if isinstance(item, dict))
@@ -3602,12 +4977,15 @@ def _merge_auto_asset_cache_entry(cache: dict[str, Any], entry: dict[str, Any]) 
                 "place_id": place_id,
                 "scene_keys": [],
                 "description": str(update.get("description") or ""),
+                "style_master_path": str(update.get("style_master_path") or update.get("converted_path") or ""),
                 "versions": {},
                 "suspected_candidates": [],
             },
         )
         if update.get("description"):
             place["description"] = str(update["description"])
+        if update.get("style_master_path") or not place.get("style_master_path"):
+            place["style_master_path"] = str(update.get("style_master_path") or update.get("converted_path") or "")
         scene_key = str(update.get("scene_key") or "")
         if scene_key:
             scene_keys = place.setdefault("scene_keys", [])
@@ -3619,6 +4997,7 @@ def _merge_auto_asset_cache_entry(cache: dict[str, Any], entry: dict[str, Any]) 
             version_id,
             {
                 "version_id": version_id,
+                "view_id": version_id,
                 "scene_key": scene_key,
                 "description": str(update.get("description") or ""),
                 "converted_path": str(update.get("converted_path") or ""),
@@ -3627,6 +5006,7 @@ def _merge_auto_asset_cache_entry(cache: dict[str, Any], entry: dict[str, Any]) 
         )
         if not version.get("converted_path"):
             version["converted_path"] = str(update.get("converted_path") or "")
+        version["view_id"] = version_id
         if update.get("description"):
             version["description"] = str(update["description"])
         _append_source_observations(version, update.get("source_observations") or [])
@@ -3655,6 +5035,7 @@ def _create_auto_person_asset(
     reuse_threshold: float,
     visual_style: str = AUTO_ASSET_STYLE_WESTERN,
     style_prompt: str = "",
+    enforce_identity_gate: bool = False,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     source_images: list[Any] = []
     if person.get("first_bbox"):
@@ -3669,40 +5050,114 @@ def _create_auto_person_asset(
         kind="person_crop",
         description=str(person.get("appearance") or ""),
     )
+    source_resolution = _person_master_resolution(source_paths)
 
+    mapped_asset_id = str(person.get("mapped_asset_id") or "").strip()
+    mapped_asset_path = _asset_path_if_file(person.get("mapped_asset_path"))
+    mapped_global_id = str(person.get("global_person_id") or "").strip()
+    if mapped_global_id and mapped_asset_id:
+        publication = {
+            "tos": {"status": "already_registered", "object_key": ""},
+            "asset_library": {"status": "active", "asset_id": mapped_asset_id, "cache_reused": True},
+        }
+        return {
+            "slot": person["slot"],
+            "identity_key": person["identity_key"],
+            "person_id": mapped_global_id,
+            "global_person_id": mapped_global_id,
+            "identity_state": "linked",
+            "identity_reason": "使用人工确认的火山素材 asset_id。",
+            "appearance": person["appearance"],
+            "path": str(mapped_asset_path) if mapped_asset_path is not None else "",
+            "source_observations": source_paths,
+            "source_resolution": source_resolution,
+            "reused_from_cache": True,
+            "publication": publication,
+            "suspected_matches": [],
+        }, None
+
+    # reuse_confidence only describes the current analysis evidence. The cache
+    # verifier still needs a chance to recognize the same recurring character
+    # when wardrobe, pose, or shot framing changed.
     suspected_matches: list[dict[str, Any]] = []
-    if float(person.get("reuse_confidence", 0.0)) >= reuse_threshold:
-        candidate, suspected_matches = _find_person_cache_match(
-            cache,
-            person=person,
-            source_image=source_images[0],
-            model=analysis_model,
-            reuse_threshold=reuse_threshold,
-        )
-        if candidate is not None:
-            candidate_path = _asset_path_if_file(candidate.get("converted_path"))
-            if candidate_path is not None:
-                person_id = str(candidate.get("person_id") or "")
-                cache_update = {
-                    "category": "person",
-                    "person_id": person_id,
-                    "identity_key": str(person.get("identity_key") or ""),
-                    "appearance": str(person.get("appearance") or ""),
-                    "converted_path": str(candidate_path),
-                    "source_observations": source_observations,
-                    "suspected_candidates": suspected_matches,
-                }
-                return {
-                    "slot": person["slot"],
-                    "identity_key": person["identity_key"],
-                    "person_id": person_id,
-                    "appearance": person["appearance"],
-                    "path": str(candidate_path),
-                    "source_observations": source_paths,
-                    "reused_from_cache": True,
-                    "cache_update": cache_update,
-                    "suspected_matches": suspected_matches,
-                }, None
+    candidate, suspected_matches, uncertain_candidate_found = _find_person_cache_match(
+        cache,
+        person=person,
+        source_image=source_images[0],
+        model=analysis_model,
+        reuse_threshold=reuse_threshold,
+    )
+    if candidate is not None:
+        candidate_path = _asset_path_if_file(candidate.get("converted_path"))
+        if candidate_path is not None:
+            person_id = str(candidate.get("person_id") or "")
+            cache_update = {
+                "category": "person",
+                "person_id": person_id,
+                "identity_key": str(person.get("identity_key") or ""),
+                "appearance": str(person.get("appearance") or ""),
+                "converted_path": str(candidate_path),
+                "source_observations": source_observations,
+                "suspected_candidates": suspected_matches,
+                "publication": deepcopy(candidate.get("publication"))
+                if isinstance(candidate.get("publication"), dict)
+                else None,
+            }
+            return {
+                "slot": person["slot"],
+                "identity_key": person["identity_key"],
+                "person_id": person_id,
+                "global_person_id": person_id,
+                "identity_state": "linked",
+                "identity_reason": "已通过原始观察图核验并复用固定人物素材。",
+                "appearance": person["appearance"],
+                "path": str(candidate_path),
+                "source_observations": source_paths,
+                "source_resolution": source_resolution,
+                "reused_from_cache": True,
+                "cache_update": cache_update,
+                "publication": deepcopy(candidate.get("publication"))
+                if isinstance(candidate.get("publication"), dict)
+                else None,
+                "suspected_matches": suspected_matches,
+            }, None
+
+    evidence_confidence = float(person.get("reuse_confidence", 0.0) or 0.0)
+    eligible_for_master = bool(source_resolution.get("eligible_for_identity_master"))
+    if enforce_identity_gate and (
+        not eligible_for_master or evidence_confidence < AUTO_ASSET_MIN_NEW_PERSON_CONFIDENCE
+    ):
+        reason = str(source_resolution.get("reason") or "").strip()
+        if evidence_confidence < AUTO_ASSET_MIN_NEW_PERSON_CONFIDENCE:
+            reason = (
+                f"人物可见证据置信度仅 {evidence_confidence:.2f}，低于首次建立人物母版所需的 "
+                f"{AUTO_ASSET_MIN_NEW_PERSON_CONFIDENCE:.2f}。"
+            )
+        return {
+            "slot": person["slot"],
+            "identity_key": person["identity_key"],
+            "person_id": "",
+            "global_person_id": "",
+            "appearance": person["appearance"],
+            "path": "",
+            "source_observations": source_paths,
+            "source_resolution": source_resolution,
+            "reused_from_cache": False,
+            "identity_state": "partial",
+            "identity_reason": reason or "只有局部、背影或远景证据，不建立独立人物素材。",
+            "suspected_matches": suspected_matches,
+        }, None
+    if enforce_identity_gate and uncertain_candidate_found:
+        return None, {
+            "kind": "person_identity",
+            "slot": str(person.get("slot") or ""),
+            "error_kind": "identity_review_required",
+            "identity_state": "unresolved",
+            "message": "人物与已有素材存在候选关系，但原始画面证据不足以自动确认；已停止新建人物素材，等待人工映射。",
+            "suspected_matches": suspected_matches,
+            "source_observations": source_paths,
+            "source_resolution": source_resolution,
+        }
 
     try:
         image = _generate_auto_asset_image(
@@ -3728,9 +5183,13 @@ def _create_auto_person_asset(
             "slot": person["slot"],
             "identity_key": person["identity_key"],
             "person_id": person_id,
+            "global_person_id": person_id,
+            "identity_state": "confirmed",
+            "identity_reason": "清晰原始观察首次建立固定人物素材。",
             "appearance": person["appearance"],
             "path": str(path),
             "source_observations": source_paths,
+            "source_resolution": source_resolution,
             "reused_from_cache": False,
             "cache_update": cache_update,
             "suspected_matches": suspected_matches,
@@ -3784,6 +5243,7 @@ def _create_auto_scene_asset(
                     "category": "scene",
                     "place_id": place_id,
                     "version_id": version_id,
+                    "view_id": version_id,
                     "scene_key": scene_key,
                     "description": description,
                     "converted_path": str(candidate_path),
@@ -3796,16 +5256,62 @@ def _create_auto_scene_asset(
                     "scene_key": scene_key,
                     "place_id": place_id,
                     "version_id": version_id,
+                    "view_id": str(candidate.get("view_id") or version_id),
                     "path": str(candidate_path),
+                    "style_master_path": str(candidate.get("style_master_path") or candidate_path),
+                    "integrated_frame_path": str(candidate.get("integrated_frame_path") or ""),
+                    "integrated_frame_quality": candidate.get("integrated_frame_quality")
+                    if isinstance(candidate.get("integrated_frame_quality"), dict)
+                    else {},
                     "source_observations": [str(source_frame_path)],
                     "reused_from_cache": True,
                     "cache_update": cache_update,
                     "suspected_matches": suspected_matches,
                 }, None
 
+        # A different camera/time view of the same physical place can use the
+        # established replacement environment as-is. The final integrated frame
+        # still follows this shot's composition, so another scene image request
+        # is unnecessary.
+        same_place_master = _scene_style_master_path(cache, matched_place_id or "")
+        if same_place_master is not None:
+            place_id = str(matched_place_id or "")
+            version_id = f"{place_id}:replacement_master"
+            cache_update = {
+                "category": "scene",
+                "place_id": place_id,
+                "version_id": version_id,
+                "view_id": version_id,
+                "scene_key": scene_key,
+                "description": description,
+                "converted_path": str(same_place_master),
+                "style_master_path": str(same_place_master),
+                "source_observations": source_observations,
+                "suspected_candidates": suspected_matches,
+            }
+            return {
+                "role": role,
+                "description": description,
+                "scene_key": scene_key,
+                "place_id": place_id,
+                "version_id": version_id,
+                "view_id": version_id,
+                "path": str(same_place_master),
+                "style_master_path": str(same_place_master),
+                "source_observations": [str(source_frame_path)],
+                "reused_from_cache": True,
+                "reuse_scope": "same_place",
+                "cache_update": cache_update,
+                "suspected_matches": suspected_matches,
+            }, None
+
     try:
+        style_master_path = _scene_style_master_path(cache, matched_place_id or "")
+        image_inputs = [source_frame]
+        if style_master_path is not None:
+            image_inputs.append(_load_image_file(style_master_path))
         image = _generate_auto_asset_image(
-            [source_frame],
+            image_inputs,
             prompt=_scene_asset_prompt(
                 description,
                 position="开始" if role == "scene_start" else "结束",
@@ -3827,6 +5333,7 @@ def _create_auto_scene_asset(
             "scene_key": scene_key,
             "description": description,
             "converted_path": str(path),
+            "style_master_path": str(style_master_path or path),
             "source_observations": source_observations,
             "suspected_candidates": suspected_matches,
         }
@@ -3836,7 +5343,10 @@ def _create_auto_scene_asset(
             "scene_key": scene_key,
             "place_id": place_id,
             "version_id": version_id,
+            "view_id": version_id,
             "path": str(path),
+            "style_master_path": str(style_master_path or path),
+            "style_master_reused": style_master_path is not None,
             "source_observations": [str(source_frame_path)],
             "reused_from_cache": False,
             "cache_update": cache_update,
@@ -3852,9 +5362,479 @@ def _create_auto_scene_asset(
         }
 
 
+def _integrated_frame_specs(task: dict[str, Any]) -> list[dict[str, Any]]:
+    assets = task.get("auto_assets") if isinstance(task.get("auto_assets"), dict) else {}
+    source_frames = assets.get("source_frames") if isinstance(assets.get("source_frames"), dict) else {}
+    scenes = {
+        str(item.get("role") or ""): item
+        for item in assets.get("scenes", [])
+        if isinstance(item, dict)
+    }
+    specs: list[dict[str, Any]] = []
+    start_source = _asset_path_if_file(source_frames.get("source_start"))
+    start_scene = scenes.get("scene_start")
+    if start_source is not None and isinstance(start_scene, dict):
+        specs.append({"role": "frame_start", "source_path": start_source, "scene": start_scene})
+    end_source = _asset_path_if_file(source_frames.get("source_end"))
+    end_scene = scenes.get("scene_end")
+    if end_source is not None and isinstance(end_scene, dict):
+        specs.append({"role": "frame_end", "source_path": end_source, "scene": end_scene})
+    return specs
+
+
+def _eligible_person_master_entries(task: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    assets = task.get("auto_assets") if isinstance(task.get("auto_assets"), dict) else {}
+    eligible: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    for item in assets.get("people", []):
+        if not isinstance(item, dict) or _asset_path_if_file(item.get("path")) is None:
+            continue
+        resolution = item.get("source_resolution") if isinstance(item.get("source_resolution"), dict) else {}
+        if not resolution:
+            resolution = _person_master_resolution(
+                [str(value) for value in item.get("source_observations", []) if str(value or "").strip()]
+            )
+            item["source_resolution"] = resolution
+        if bool(resolution.get("eligible_for_identity_master")):
+            eligible.append(item)
+        else:
+            warnings.append(
+                {
+                    "kind": "person_master_too_small",
+                    "slot": str(item.get("slot") or ""),
+                    "message": str(resolution.get("reason") or "人物源裁剪过小，不作为身份母版。"),
+                }
+            )
+    return eligible, warnings
+
+
+def _integrated_frame_attempt(
+    *,
+    task: dict[str, Any],
+    spec: dict[str, Any],
+    root: Path,
+    attempt: int,
+    style_master_path: Path | None,
+    analysis_model: str,
+    image_model: str,
+    image_quality: str,
+    image_provider: str,
+    visual_style: str,
+    style_prompt: str,
+    retry_reasons: list[str] | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    role = str(spec["role"])
+    source_path = Path(spec["source_path"])
+    scene = spec["scene"]
+    source_frame = _load_image_file(source_path)
+    person_entries, _warnings = _eligible_person_master_entries(task)
+    exact_integrated_path = _asset_path_if_file(scene.get("integrated_frame_path"))
+    exact_quality = scene.get("integrated_frame_quality") if isinstance(scene.get("integrated_frame_quality"), dict) else {}
+    if (
+        attempt == 1
+        and not (task.get("auto_asset_analysis") or {}).get("people")
+        and exact_integrated_path is not None
+        and exact_quality.get("verdict") == "approved"
+    ):
+        quality = dict(exact_quality)
+        quality["reused_exact_view"] = True
+        quality.setdefault("version", AUTO_ASSET_QUALITY_GATE_VERSION)
+        return {
+            "role": role,
+            "path": str(exact_integrated_path),
+            "source_path": str(source_path),
+            "place_id": str(scene.get("place_id") or ""),
+            "view_id": str(scene.get("view_id") or scene.get("version_id") or ""),
+            "scene_master_path": str(scene.get("path") or ""),
+            "style_master_path": str(scene.get("style_master_path") or ""),
+            "person_master_ids": [],
+            "generation_attempts": 0,
+            "quality": quality,
+            "reused_from_cache": True,
+        }, None
+    person_paths = [path for item in person_entries if (path := _asset_path_if_file(item.get("path"))) is not None]
+    person_masters = [_load_image_file(path) for path in person_paths]
+    scene_path = _asset_path_if_file(scene.get("path"))
+    scene_master = _load_image_file(scene_path) if scene_path is not None else None
+    normalized_style_path = style_master_path if style_master_path is not None and style_master_path.is_file() else None
+    if normalized_style_path is not None and scene_path is not None:
+        try:
+            if normalized_style_path.resolve() == scene_path.resolve():
+                normalized_style_path = None
+        except OSError:
+            pass
+    style_master = _load_image_file(normalized_style_path) if normalized_style_path is not None else None
+    inputs: list[Any] = [source_frame, *person_masters]
+    if scene_master is not None:
+        inputs.append(scene_master)
+    if style_master is not None:
+        inputs.append(style_master)
+    try:
+        candidate = _generate_auto_asset_image(
+            inputs,
+            prompt=_integrated_frame_prompt(
+                task.get("auto_asset_analysis") or {},
+                role=role,
+                person_master_count=len(person_masters),
+                has_scene_master=scene_master is not None,
+                has_style_master=style_master is not None,
+                visual_style=visual_style,
+                style_prompt=style_prompt,
+                retry_reasons=retry_reasons,
+            ),
+            image_model=image_model,
+            image_quality=image_quality,
+            image_provider=image_provider,
+        )
+        path = root / "integrated_frames" / f"{role}_attempt_{attempt:02d}.png"
+        _save_image_tensor(candidate, path)
+        quality = _evaluate_integrated_frame_quality(
+            source_frame=source_frame,
+            candidate=candidate,
+            person_masters=person_masters,
+            scene_master=scene_master,
+            style_master=style_master,
+            analysis=task.get("auto_asset_analysis") or {},
+            model=analysis_model,
+            visual_style=visual_style,
+            style_prompt=style_prompt,
+        )
+        return {
+            "role": role,
+            "path": str(path),
+            "source_path": str(source_path),
+            "place_id": str(scene.get("place_id") or ""),
+            "view_id": str(scene.get("view_id") or scene.get("version_id") or ""),
+            "scene_master_path": str(scene_path or ""),
+            "style_master_path": str(normalized_style_path or ""),
+            "person_master_ids": [str(item.get("person_id") or item.get("slot") or "") for item in person_entries],
+            "generation_attempts": attempt,
+            "quality": quality,
+            "reused_from_cache": False,
+        }, None
+    except Exception as exc:
+        return None, {
+            "kind": "integrated_frame",
+            "role": role,
+            "message": str(exc),
+            "error_kind": "provider_policy" if _provider_policy_error(exc) else "generation_or_quality_failed",
+            "attempts": attempt,
+        }
+
+
+def _adaptive_integrated_frame_floor(entries: list[dict[str, Any]]) -> float:
+    approved_scores = [
+        _score01((item.get("quality") or {}).get("target_style_score"))
+        for item in entries
+        if isinstance(item.get("quality"), dict) and item["quality"].get("verdict") == "approved"
+    ]
+    if not approved_scores:
+        return AUTO_ASSET_TARGET_STYLE_THRESHOLD
+    return max(AUTO_ASSET_TARGET_STYLE_THRESHOLD, max(approved_scores) - 0.08)
+
+
+def _apply_integrated_frame_group_floor(entries: list[dict[str, Any]], floor: float) -> None:
+    for entry in entries:
+        quality = entry.get("quality") if isinstance(entry.get("quality"), dict) else {}
+        score = _score01(quality.get("target_style_score"))
+        if quality.get("verdict") == "approved" and score + 1e-9 < floor:
+            quality["verdict"] = "retry"
+            reasons = quality.setdefault("reasons", [])
+            message = f"低于本组自适应风格下限（{score:.2f} < {floor:.2f}）"
+            if message not in reasons:
+                reasons.append(message)
+            quality["adaptive_group_style_floor"] = floor
+
+
+def _record_integrated_frame_cache(cache: dict[str, Any], entry: dict[str, Any], *, has_people: bool) -> None:
+    if (entry.get("quality") or {}).get("verdict") != "approved":
+        return
+    path = _asset_path_if_file(entry.get("path"))
+    place_id = str(entry.get("place_id") or "")
+    view_id = str(entry.get("view_id") or "")
+    if path is None or not place_id:
+        return
+    place = _scene_cache_place(cache, place_id)
+    if isinstance(place, dict):
+        current_style = _asset_path_if_file(place.get("style_master_path"))
+        if current_style is None:
+            place["style_master_path"] = str(path)
+        version = _scene_cache_version(cache, place_id, view_id)
+        if isinstance(version, dict) and not has_people:
+            version["integrated_frame_path"] = str(path)
+            version["integrated_frame_quality"] = dict(entry.get("quality") or {})
+    scenes = cache.get("scenes") if isinstance(cache.get("scenes"), dict) else {}
+    current_global = _asset_path_if_file(scenes.get("style_master_path"))
+    quality = entry.get("quality") if isinstance(entry.get("quality"), dict) else {}
+    score = _score01(quality.get("target_style_score"))
+    current_score = _score01(scenes.get("style_master_quality_score"))
+    if current_global is None or score > current_score + 1e-9:
+        scenes["style_master_path"] = str(path)
+        scenes["style_master_id"] = f"{place_id}:{view_id}"
+        scenes["style_master_quality_score"] = score
+
+
+def _build_integrated_frames(
+    job: LongVideoJob,
+    cache: dict[str, Any],
+    *,
+    image_concurrency: int,
+    image_model: str,
+    image_quality: str,
+    image_provider: str,
+    visual_style: str,
+    style_prompt: str,
+    progress_bar: ProgressBar | None = None,
+) -> tuple[int, list[dict[str, Any]]]:
+    tasks = _auto_asset_member_tasks(job)
+    work: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    all_specs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    entries_by_task: dict[int, dict[str, dict[str, Any]]] = {}
+    warnings_by_task: dict[int, list[dict[str, Any]]] = {}
+    errors_by_task: dict[int, list[dict[str, Any]]] = {}
+    for task in tasks:
+        if not isinstance(task, dict) or task.get("auto_asset_status") not in {"ready", "masters_ready"}:
+            continue
+        task_index = int(task["index"])
+        assets = task.get("auto_assets") if isinstance(task.get("auto_assets"), dict) else {}
+        existing = _approved_integrated_frames(assets)
+        entries_by_task[task_index] = dict(existing)
+        _eligible, resolution_warnings = _eligible_person_master_entries(task)
+        warnings_by_task[task_index] = [
+            dict(item) for item in task.get("auto_asset_warnings", []) if isinstance(item, dict)
+        ]
+        warnings_by_task[task_index].extend(resolution_warnings)
+        errors_by_task[task_index] = [
+            dict(item)
+            for item in task.get("auto_asset_errors", [])
+            if isinstance(item, dict) and item.get("kind") != "integrated_frame"
+        ]
+        for spec in _integrated_frame_specs(task):
+            all_specs.append((task, spec))
+            if str(spec["role"]) not in existing:
+                work.append((task, spec))
+
+    generated_count = 0
+
+    def emit_result(task: dict[str, Any], *, phase: str, message: str) -> None:
+        if progress_bar is None:
+            return
+        assets = task.get("auto_assets") if isinstance(task.get("auto_assets"), dict) else {}
+        integrated = list(entries_by_task.get(int(task["index"]), {}).values())
+        _emit_auto_asset_progress(
+            job,
+            progress_bar,
+            value=max(0.0, len(tasks) - 0.02),
+            total=max(1, len(tasks)),
+            phase=phase,
+            message=message,
+            task=task,
+            extra={
+                "preview": _auto_asset_preview_payload(
+                    task,
+                    source_frames=assets.get("source_frames", {}),
+                    people=[dict(item) for item in assets.get("people", []) if isinstance(item, dict)],
+                    scenes=[dict(item) for item in assets.get("scenes", []) if isinstance(item, dict)],
+                    integrated_frames=integrated,
+                )
+            },
+        )
+
+    def run_attempt(
+        task: dict[str, Any],
+        spec: dict[str, Any],
+        attempt: int,
+        style_anchor: Path | None,
+        reasons: list[str] | None,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]:
+        entry, error = _integrated_frame_attempt(
+            task=task,
+            spec=spec,
+            root=_auto_asset_root(job, task),
+            attempt=attempt,
+            style_master_path=style_anchor,
+            analysis_model=job.ai_model,
+            image_model=image_model,
+            image_quality=image_quality,
+            image_provider=image_provider,
+            visual_style=visual_style,
+            style_prompt=style_prompt,
+            retry_reasons=reasons,
+        )
+        return task, spec, entry, error
+
+    worker_count = max(1, len(work)) if image_concurrency == 0 else max(1, min(image_concurrency, len(work) or 1))
+    # An approved frame belongs to one shot composition. Reusing it as a global
+    # style reference leaks that shot's people, layout, and background into
+    # unrelated shots. Each integrated request already has its own scene master
+    # and target-style text, so keep the reference set shot-local.
+    global_style_path = None
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="company-integrated") as executor:
+        futures = [executor.submit(run_attempt, task, spec, 1, None, None) for task, spec in work]
+        for future in as_completed(futures):
+            task, spec, entry, error = future.result()
+            generated_count += 1
+            task_index = int(task["index"])
+            role = str(spec["role"])
+            if entry is not None:
+                entries_by_task[task_index][role] = entry
+                verdict = str((entry.get("quality") or {}).get("verdict") or "retry")
+                emit_result(
+                    task,
+                    phase="integrated_frame_ready" if verdict == "approved" else "integrated_frame_retrying",
+                    message=(
+                        f"第 {task_index} 段{role}整帧转换已通过。"
+                        if verdict == "approved"
+                        else f"第 {task_index} 段{role}转换效果偏弱，将自动重试。"
+                    ),
+                )
+            elif error is not None:
+                errors_by_task[task_index].append(error)
+                emit_result(task, phase="integrated_frame_failed", message=f"第 {task_index} 段{role}整帧转换失败。")
+
+    all_entries = [entry for values in entries_by_task.values() for entry in values.values()]
+    floor = _adaptive_integrated_frame_floor(all_entries)
+    _apply_integrated_frame_group_floor(all_entries, floor)
+
+    approved = [
+        item for item in all_entries if (item.get("quality") or {}).get("verdict") == "approved"
+    ]
+    approved.sort(
+        key=lambda item: (
+            _score01((item.get("quality") or {}).get("target_style_score")),
+            _score01((item.get("quality") or {}).get("composition_preservation")),
+        ),
+        reverse=True,
+    )
+    style_anchor = None
+
+    total_attempts = max(1, int(job.max_retries) + 1)
+    for attempt in range(2, total_attempts + 1):
+        retry_work: list[tuple[dict[str, Any], dict[str, Any], list[str]]] = []
+        for task, spec in all_specs:
+            entry = entries_by_task[int(task["index"])].get(str(spec["role"]))
+            quality = entry.get("quality") if isinstance(entry, dict) and isinstance(entry.get("quality"), dict) else {}
+            if quality.get("verdict") != "approved":
+                retry_work.append((task, spec, _as_string_list(quality.get("reasons"))))
+        if not retry_work:
+            break
+        with ThreadPoolExecutor(
+            max_workers=max(1, len(retry_work)) if image_concurrency == 0 else max(1, min(image_concurrency, len(retry_work))),
+            thread_name_prefix="company-integrated-retry",
+        ) as executor:
+            futures = [
+                executor.submit(run_attempt, task, spec, attempt, None, reasons)
+                for task, spec, reasons in retry_work
+            ]
+            for future in as_completed(futures):
+                task, spec, entry, error = future.result()
+                generated_count += 1
+                task_index = int(task["index"])
+                role = str(spec["role"])
+                errors_by_task[task_index] = [
+                    item for item in errors_by_task[task_index]
+                    if not (item.get("kind") == "integrated_frame" and item.get("role") == role)
+                ]
+                if entry is not None:
+                    entries_by_task[task_index][role] = entry
+                    verdict = str((entry.get("quality") or {}).get("verdict") or "retry")
+                    emit_result(
+                        task,
+                        phase="integrated_frame_ready" if verdict == "approved" else "integrated_frame_retrying",
+                        message=(
+                            f"第 {task_index} 段{role}第 {attempt} 次转换已通过。"
+                            if verdict == "approved"
+                            else f"第 {task_index} 段{role}第 {attempt} 次转换仍偏弱。"
+                        ),
+                    )
+                elif error is not None:
+                    errors_by_task[task_index].append(error)
+                    emit_result(
+                        task,
+                        phase="integrated_frame_failed",
+                        message=f"第 {task_index} 段{role}第 {attempt} 次转换失败。",
+                    )
+        all_entries = [entry for values in entries_by_task.values() for entry in values.values()]
+        floor = _adaptive_integrated_frame_floor(all_entries)
+        _apply_integrated_frame_group_floor(all_entries, floor)
+        approved = [item for item in all_entries if (item.get("quality") or {}).get("verdict") == "approved"]
+        approved.sort(key=lambda item: _score01((item.get("quality") or {}).get("target_style_score")), reverse=True)
+        # Do not turn a frame from one shot into a style/layout reference for
+        # the next shot. Retries must remain grounded in their own source frame
+        # and shot-local masters.
+
+    reports: list[dict[str, Any]] = []
+    for task in tasks:
+        if not isinstance(task, dict) or int(task.get("index", 0)) not in entries_by_task:
+            continue
+        task_index = int(task["index"])
+        assets = task.get("auto_assets") if isinstance(task.get("auto_assets"), dict) else {}
+        integrated = [entries_by_task[task_index][spec["role"]] for spec in _integrated_frame_specs(task) if spec["role"] in entries_by_task[task_index]]
+        expected_roles = [str(spec["role"]) for spec in _integrated_frame_specs(task)]
+        approved_roles = {
+            str(item.get("role"))
+            for item in integrated
+            if (item.get("quality") or {}).get("verdict") == "approved"
+        }
+        for item in integrated:
+            _record_integrated_frame_cache(cache, item, has_people=bool((task.get("auto_asset_analysis") or {}).get("people")))
+        missing = [role for role in expected_roles if role not in approved_roles]
+        errors = errors_by_task[task_index]
+        for role in missing:
+            entry = entries_by_task[task_index].get(role) or {}
+            quality = entry.get("quality") if isinstance(entry.get("quality"), dict) else {}
+            errors.append(
+                {
+                    "kind": "integrated_frame",
+                    "role": role,
+                    "error_kind": "quality_gate_failed",
+                    "message": "整帧转绘在自动重试后仍未通过：" + ("；".join(_as_string_list(quality.get("reasons"))) or "没有合格结果"),
+                    "attempts": int(entry.get("generation_attempts") or total_attempts),
+                }
+            )
+        status = "ready" if expected_roles and not missing and not errors else "degraded"
+        _checkpoint_auto_asset_task(
+            job,
+            _auto_asset_root(job, task),
+            task,
+            source_frames=assets.get("source_frames", {}),
+            analysis=task.get("auto_asset_analysis") if isinstance(task.get("auto_asset_analysis"), dict) else None,
+            people=[dict(item) for item in assets.get("people", []) if isinstance(item, dict)],
+            scenes=[dict(item) for item in assets.get("scenes", []) if isinstance(item, dict)],
+            integrated_frames=integrated,
+            errors=errors,
+            status=status,
+            suspected_matches=task.get("auto_asset_suspected_matches", []),
+            warnings=warnings_by_task[task_index],
+        )
+        emit_result(
+            task,
+            phase="integrated_frame_task_ready" if status == "ready" else "integrated_frame_task_failed",
+            message=(
+                f"第 {task_index} 段整帧转换全部通过。"
+                if status == "ready"
+                else f"第 {task_index} 段仍有整帧转换未通过，已阻止进入 Seedance。"
+            ),
+        )
+        reports.append(
+            {
+                "index": task_index,
+                "status": status,
+                "integrated_frames": len(integrated),
+                "approved_integrated_frames": len(approved_roles),
+                "adaptive_style_floor": round(floor, 4),
+                "errors": errors,
+            }
+        )
+    return generated_count, reports
+
+
 def build_long_video_auto_assets(
     job: LongVideoJob,
     image_concurrency: int = 0,
+    *,
+    cancel_event: threading.Event | None = None,
+    preserve_job_status: bool = False,
 ) -> tuple[LongVideoJob, str, torch.Tensor]:
     if job.manifest.get("asset_mode") != "auto_shot_assets":
         raise ValueError("该任务不是按镜头自动资产任务，请使用原有手工资产节点链路。")
@@ -3868,8 +5848,26 @@ def build_long_video_auto_assets(
     style_prompt = str(job.prompt or "")
     reuse_threshold = float(options.get("reuse_threshold", AUTO_ASSET_DEFAULT_REUSE_THRESHOLD))
     force_rerun_assets = bool(options.get("force_rerun_assets", False))
+    requires_integrated_frames = (
+        get_video_engine_adapter(job.engine).key == "seedance"
+        and bool(options.get("use_integrated_frame_references", False))
+    )
+    enforce_identity_gate = int(job.manifest.get("processing_contract_version", 0)) in {
+        V3_PROCESSING_CONTRACT_VERSION,
+        MANUAL_BATCH_PROCESSING_CONTRACT_VERSION,
+    }
+    identity_mapping = (
+        _load_identity_mapping(options.get("identity_mapping"))
+        if enforce_identity_gate
+        else _empty_identity_mapping()
+    )
     image_concurrency = max(0, int(image_concurrency))
     cache = _empty_auto_asset_cache() if force_rerun_assets else _load_auto_asset_cache(job)
+    if not force_rerun_assets:
+        # A job cache only covers one attempt. Merge the persistent library
+        # first so a new manual series still recognizes already-approved
+        # recurring people and locations.
+        _merge_auto_asset_cache_data(cache, _load_auto_asset_library(visual_style), persistent_library=True)
     tasks = _auto_asset_member_tasks(job)
     task_count = len(tasks)
     progress = ProgressBar(max(1, task_count))
@@ -3885,6 +5883,7 @@ def build_long_video_auto_assets(
     )
 
     submitted_count = 0
+    cancelled = False
     worker_limit = (
         max(1, task_count * (AUTO_ASSET_MAX_PEOPLE + 2))
         if image_concurrency == 0
@@ -3893,6 +5892,9 @@ def build_long_video_auto_assets(
 
     with ThreadPoolExecutor(max_workers=worker_limit, thread_name_prefix="company-image") as executor:
         for task_offset, task in enumerate(tasks):
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                break
             task_index = int(task.get("index", task_offset + 1))
 
             def update_task_progress(
@@ -3915,12 +5917,77 @@ def build_long_video_auto_assets(
 
             root = _auto_asset_root(job, task)
             previous_assets = task.get("auto_assets") if isinstance(task.get("auto_assets"), dict) else {}
-            if can_resume_assets and _auto_asset_task_complete(task, root, reuse_threshold=reuse_threshold):
-                reports.append({"index": task["index"], "status": task["auto_asset_status"], "reused": True})
+            if can_resume_assets and _auto_asset_task_complete(
+                task,
+                root,
+                reuse_threshold=reuse_threshold,
+                require_integrated_frames=requires_integrated_frames,
+            ):
+                reused_assets = task.get("auto_assets") if isinstance(task.get("auto_assets"), dict) else {}
+                reused_people = [dict(item) for item in reused_assets.get("people", []) if isinstance(item, dict)]
+                reused_scenes = [dict(item) for item in reused_assets.get("scenes", []) if isinstance(item, dict)]
+                reused_warnings = [
+                    dict(item) for item in task.get("auto_asset_warnings", []) if isinstance(item, dict)
+                ]
+                publication_errors: list[dict[str, Any]] = []
+                publication_changed = False
+                for person in reused_people:
+                    if _active_person_asset_id(person):
+                        continue
+                    publication_changed = True
+                    warning, publication_error = _publish_auto_person_asset(person, task_index=task_index)
+                    if warning is not None:
+                        reused_warnings.append(warning)
+                    if publication_error is not None:
+                        publication_errors.append(publication_error)
+
+                if publication_changed:
+                    _checkpoint_auto_asset_task(
+                        job,
+                        root,
+                        task,
+                        source_frames=reused_assets.get("source_frames", {}),
+                        analysis=task.get("auto_asset_analysis") if isinstance(task.get("auto_asset_analysis"), dict) else None,
+                        people=reused_people,
+                        scenes=reused_scenes,
+                        errors=publication_errors,
+                        status="degraded" if publication_errors else "ready",
+                        suspected_matches=task.get("auto_asset_suspected_matches", []),
+                        warnings=reused_warnings,
+                    )
+                current_status = str(task.get("auto_asset_status") or "ready")
+                reports.append(
+                    {
+                        "index": task["index"],
+                        "status": current_status,
+                        "reused": True,
+                        "errors": publication_errors,
+                        "warnings": reused_warnings,
+                    }
+                )
                 update_task_progress(
                     1.0,
-                    "task_reused",
-                    f"第 {task_index} 段已有完整自动资产，直接复用。",
+                    "task_reused" if not publication_errors else "task_blocked",
+                    (
+                        f"第 {task_index} 段已有完整自动资产，直接复用。"
+                        if not publication_errors
+                        else f"第 {task_index} 段人物素材上传 TOS 失败，已阻断后续视频请求。"
+                    ),
+                    extra={
+                        "errors": publication_errors,
+                        "warnings": reused_warnings,
+                        "preview": _auto_asset_preview_payload(
+                            task,
+                            source_frames=reused_assets.get("source_frames", {}),
+                            people=reused_people,
+                            scenes=reused_scenes,
+                            integrated_frames=[
+                                dict(item)
+                                for item in reused_assets.get("integrated_frames", [])
+                                if isinstance(item, dict)
+                            ],
+                        )
+                    },
                 )
                 continue
 
@@ -3929,8 +5996,17 @@ def build_long_video_auto_assets(
                 0.02,
                 "task_started",
                 f"开始处理第 {task_index} 段自动资产。",
+                extra={
+                    "preview": _auto_asset_preview_payload(
+                        task,
+                        source_frames={},
+                        people=[],
+                        scenes=[],
+                    )
+                },
             )
             errors: list[dict[str, Any]] = []
+            warnings: list[dict[str, Any]] = []
             frames: torch.Tensor | None = None
             source_frames: dict[str, str] = {}
             source_frames_reused = False
@@ -3971,20 +6047,67 @@ def build_long_video_auto_assets(
                 0.22,
                 "source_frames_ready",
                 f"第 {task_index} 段源帧{'已复用' if source_frames_reused else '已提取'}。",
+                extra={
+                    "preview": _auto_asset_preview_payload(
+                        task,
+                        source_frames=source_frames,
+                        people=[],
+                        scenes=[],
+                    )
+                },
             )
 
             analysis = task.get("auto_asset_analysis") if can_resume_assets else None
             analysis_reused = isinstance(analysis, dict)
+            analysis_attempts = int(task.get("auto_asset_analysis_attempts") or 0) if analysis_reused else 0
             if not analysis_reused:
                 update_task_progress(
                     0.28,
                     "analysis_started",
                     f"第 {task_index} 段正在分析人物和背景。",
                 )
+
+                def analyze_current_task() -> dict[str, Any]:
+                    nonlocal analysis_attempts
+                    analysis_attempts += 1
+                    return _auto_asset_analysis(frames, model=job.ai_model)
+
+                def report_analysis_retry(
+                    failed_attempt: int,
+                    total_attempts: int,
+                    delay: float,
+                    exc: Exception,
+                ) -> None:
+                    retries_remaining = total_attempts - failed_attempt
+                    update_task_progress(
+                        0.28,
+                        "analysis_retrying",
+                        (
+                            f"第 {task_index} 段人物和背景分析第 {failed_attempt} 次失败，"
+                            f"{delay:g} 秒后重试（剩余 {retries_remaining} 次）：{exc}"
+                        ),
+                        extra={
+                            "attempt": failed_attempt,
+                            "total_attempts": total_attempts,
+                            "retries_remaining": retries_remaining,
+                            "retry_delay_seconds": delay,
+                            "error": str(exc),
+                        },
+                    )
+
                 try:
-                    analysis = _auto_asset_analysis(frames, model=job.ai_model)
+                    analysis, analysis_attempts = _retry_auto_asset_analysis(
+                        analyze_current_task,
+                        max_retries=job.max_retries,
+                        on_retry=report_analysis_retry,
+                    )
                 except Exception as exc:
-                    error = {"kind": "analysis", "message": str(exc)}
+                    task["auto_asset_analysis_attempts"] = analysis_attempts
+                    error = {
+                        "kind": "analysis",
+                        "message": str(exc),
+                        "attempts": analysis_attempts,
+                    }
                     _checkpoint_auto_asset_task(
                         job,
                         root,
@@ -4000,17 +6123,25 @@ def build_long_video_auto_assets(
                     update_task_progress(
                         1.0,
                         "analysis_failed",
-                        f"第 {task_index} 段人物和背景分析失败：{exc}",
-                        extra={"error": str(exc)},
+                        f"第 {task_index} 段人物和背景分析在 {analysis_attempts} 次尝试后失败：{exc}",
+                        extra={"error": str(exc), "attempts": analysis_attempts},
                     )
                     continue
+                task["auto_asset_analysis_attempts"] = analysis_attempts
             update_task_progress(
                 0.40,
                 "analysis_ready",
                 f"第 {task_index} 段人物和背景分析{'已复用' if analysis_reused else '完成'}。",
                 extra={
+                    "analysis_attempts": analysis_attempts,
                     "people_count": len(analysis.get("people", [])) if isinstance(analysis, dict) else 0,
                     "shot_stability": str(analysis.get("shot_stability", "")) if isinstance(analysis, dict) else "",
+                    "preview": _auto_asset_preview_payload(
+                        task,
+                        source_frames=source_frames,
+                        people=[],
+                        scenes=[],
+                    ),
                 },
             )
 
@@ -4022,7 +6153,31 @@ def build_long_video_auto_assets(
             task["auto_asset_analysis"] = analysis
             task["auto_asset_status"] = "building"
             task["auto_asset_errors"] = []
+            task["auto_asset_warnings"] = []
             task["auto_asset_suspected_matches"] = []
+            try:
+                _apply_identity_mapping_to_analysis(task, identity_mapping)
+            except ValueError as exc:
+                error = {"kind": "identity_mapping", "message": str(exc), "error_kind": "identity_mapping_invalid"}
+                _checkpoint_auto_asset_task(
+                    job,
+                    root,
+                    task,
+                    source_frames=source_frames,
+                    analysis=analysis,
+                    people=[],
+                    scenes=[],
+                    errors=[error],
+                    status="identity_mapping_failed",
+                )
+                reports.append({"index": task["index"], "status": "identity_mapping_failed", "error": str(exc)})
+                update_task_progress(
+                    1.0,
+                    "identity_mapping_failed",
+                    f"第 {task_index} 段人物映射无效，已阻止付费生成：{exc}",
+                    extra={"error": str(exc)},
+                )
+                continue
             _write_auto_asset_manifest(root, task)
             _atomic_write_json(job.manifest_path, job.manifest)
 
@@ -4047,6 +6202,16 @@ def build_long_video_auto_assets(
                     slot = str(person.get("slot") or "")
                     existing = existing_people.get(slot)
                     if existing is not None:
+                        existing = dict(existing)
+                        if not _active_person_asset_id(existing):
+                            warning, publication_error = _publish_auto_person_asset(
+                                existing,
+                                task_index=task_index,
+                            )
+                            if warning is not None:
+                                warnings.append(warning)
+                            if publication_error is not None:
+                                errors.append(publication_error)
                         people_by_slot[slot] = existing
                         reused_items.append(f"person:{slot}")
                         continue
@@ -4075,6 +6240,7 @@ def build_long_video_auto_assets(
                                 reuse_threshold=reuse_threshold,
                                 visual_style=visual_style,
                                 style_prompt=style_prompt,
+                                enforce_identity_gate=enforce_identity_gate,
                             ),
                             max_retries=job.max_retries,
                         )
@@ -4098,7 +6264,7 @@ def build_long_video_auto_assets(
                     source_frame_path=source_frame_path,
                     description=description,
                     scene_key=scene_key,
-                    allow_cache=background["same_scene_confidence"] >= reuse_threshold,
+                    allow_cache=True,
                 ):
                     request_frame = _load_image_file(source_frame_path)
                     return _retry_auto_asset_creation(
@@ -4145,18 +6311,39 @@ def build_long_video_auto_assets(
                     0.86,
                     "assets_reused",
                     f"第 {task_index} 段没有新的图片请求，素材全部来自缓存或已有文件。",
-                    extra={"reused_items": reused_items},
+                    extra={
+                        "reused_items": reused_items,
+                        "preview": _auto_asset_preview_payload(
+                            task,
+                            source_frames=source_frames,
+                            people=_ordered_auto_asset_entries(people_by_slot, person_order),
+                            scenes=_ordered_auto_asset_entries(scenes_by_role, scene_order),
+                        ),
+                    },
                 )
             for future in as_completed(list(future_jobs)):
                 kind, key = future_jobs[future]
+                publication_error: dict[str, Any] | None = None
                 try:
                     entry, error = future.result()
                 except Exception as exc:
                     entry = None
                     error = {"kind": kind, "message": str(exc), "error_kind": "generation_failed"}
                 if entry:
-                    _merge_auto_asset_cache_entry(cache, entry)
-                    _save_auto_asset_cache(job, cache)
+                    if kind == "person":
+                        if (
+                            str(entry.get("identity_state") or "") != "partial"
+                            and not _active_person_asset_id(entry)
+                        ):
+                            warning, publication_error = _publish_auto_person_asset(entry, task_index=task_index)
+                            if warning is not None:
+                                warnings.append(warning)
+                            if publication_error is not None:
+                                errors.append(publication_error)
+                    if entry.get("cache_update"):
+                        _merge_auto_asset_cache_entry(cache, entry)
+                        _save_auto_asset_cache(job, cache)
+                        _save_auto_asset_library(cache, visual_style=visual_style)
                     distributed_entry = dict(entry)
                     distributed_entry["reused_from_cache"] = bool(entry.get("reused_from_cache"))
                     distributed_entry["slot" if kind == "person" else "role"] = key
@@ -4167,6 +6354,9 @@ def build_long_video_auto_assets(
                             suspected_matches.append(dict(suspected))
                 if error:
                     errors.append(dict(error))
+                    for suspected in error.get("suspected_matches", []):
+                        if isinstance(suspected, dict):
+                            suspected_matches.append(dict(suspected))
                 people = _ordered_auto_asset_entries(people_by_slot, person_order)
                 scenes = _ordered_auto_asset_entries(scenes_by_role, scene_order)
                 _checkpoint_auto_asset_task(
@@ -4180,6 +6370,7 @@ def build_long_video_auto_assets(
                     errors=errors,
                     status="building",
                     suspected_matches=suspected_matches,
+                    warnings=warnings,
                 )
                 completed_asset_count += 1
                 update_task_progress(
@@ -4189,19 +6380,50 @@ def build_long_video_auto_assets(
                     extra={
                         "asset_kind": kind,
                         "asset_key": key,
-                        "asset_status": "ready" if entry else "failed",
-                        "error": error,
+                        "asset_status": "failed" if publication_error is not None else "ready" if entry else "failed",
+                        "error": publication_error or error,
+                        "warnings": warnings,
                         "asset_done": completed_asset_count,
                         "asset_total": len(future_jobs),
+                        "preview": _auto_asset_preview_payload(
+                            task,
+                            source_frames=source_frames,
+                            people=people,
+                            scenes=scenes,
+                        ),
                     },
                 )
 
             people = _ordered_auto_asset_entries(people_by_slot, person_order)
             scenes = _ordered_auto_asset_entries(scenes_by_role, scene_order)
+            unresolved_people = [
+                item
+                for item in errors
+                if isinstance(item, dict) and item.get("error_kind") == "identity_review_required"
+            ]
+            ignored_people = [
+                item for item in people if str(item.get("identity_state") or "") in {"partial", "ignored"}
+            ]
             expected_people = 0 if analysis["shot_stability"] == "crowded" else len(analysis["people"])
+            effective_people = len(people) + len(unresolved_people)
             expected_scenes = len(scene_specs)
-            complete = len(people) == expected_people and len(scenes) == expected_scenes and not errors
-            status = "ready" if complete else "degraded" if scenes or people else "failed"
+            blocking_errors = [
+                item
+                for item in errors
+                if not isinstance(item, dict) or item.get("error_kind") != "identity_review_required"
+            ]
+            complete = effective_people == expected_people and len(scenes) == expected_scenes and not blocking_errors
+            status = (
+                "identity_review_required"
+                if unresolved_people
+                else "masters_ready"
+                if complete and requires_integrated_frames
+                else "ready"
+                if complete
+                else "degraded"
+                if scenes or people
+                else "failed"
+            )
             _checkpoint_auto_asset_task(
                 job,
                 root,
@@ -4213,14 +6435,18 @@ def build_long_video_auto_assets(
                 errors=errors,
                 status=status,
                 suspected_matches=suspected_matches,
+                warnings=warnings,
             )
             reports.append(
                 {
                     "index": task["index"],
                     "status": status,
                     "people": len(people),
+                    "ignored_people": len(ignored_people),
+                    "unresolved_people": len(unresolved_people),
                     "scenes": len(scenes),
                     "errors": errors,
+                    "warnings": warnings,
                     "suspected_matches": suspected_matches,
                     "source_frames_reused": source_frames_reused,
                     "analysis_reused": analysis_reused,
@@ -4238,19 +6464,57 @@ def build_long_video_auto_assets(
                     "people": len(people),
                     "scenes": len(scenes),
                     "errors": errors,
+                    "warnings": warnings,
                     "suspected_matches": suspected_matches,
                     "image_request_count": len(task_pending),
                     "reused_items": reused_items,
+                    "preview": _auto_asset_preview_payload(
+                        task,
+                        source_frames=source_frames,
+                        people=people,
+                        scenes=scenes,
+                    ),
                 },
             )
+
+    integrated_request_count = 0
+    integrated_reports: list[dict[str, Any]] = []
+    if not cancelled and requires_integrated_frames:
+        _emit_auto_asset_progress(
+            job,
+            progress,
+            value=max(0.0, task_count - 0.05),
+            total=task_count,
+            phase="integrated_frames_started",
+            message="人物和场景母版已准备，开始整帧融合转绘与自适应质量验收。",
+        )
+        integrated_request_count, integrated_reports = _build_integrated_frames(
+            job,
+            cache,
+            image_concurrency=image_concurrency,
+            image_model=image_model,
+            image_quality=image_quality,
+            image_provider=image_provider,
+            visual_style=visual_style,
+            style_prompt=style_prompt,
+            progress_bar=progress,
+        )
+        submitted_count += integrated_request_count
 
     worker_count = submitted_count if image_concurrency == 0 else min(image_concurrency, submitted_count)
 
     reports.sort(key=lambda item: int(item.get("index", 0)))
     _save_auto_asset_cache(job, cache)
-    job.manifest["status"] = "auto_assets_ready" if all(
-        item.get("auto_asset_status") == "ready" for item in tasks
-    ) else "auto_assets_partial_failure"
+    _save_auto_asset_library(cache, visual_style=visual_style)
+    asset_stage_status = (
+        "auto_assets_cancelled"
+        if cancelled
+        else "auto_assets_ready"
+        if all(item.get("auto_asset_status") == "ready" for item in tasks)
+        else "auto_assets_partial_failure"
+    )
+    if not preserve_job_status:
+        job.manifest["status"] = asset_stage_status
     _atomic_write_json(job.manifest_path, job.manifest)
     _emit_auto_asset_progress(
         job,
@@ -4258,9 +6522,10 @@ def build_long_video_auto_assets(
         value=task_count,
         total=task_count,
         phase="completed",
-        message=f"自动资产阶段结束：{job.manifest['status']}。",
+        message=f"自动资产阶段结束：{asset_stage_status}。",
         extra={
             "image_request_count": submitted_count,
+            "integrated_frame_request_count": integrated_request_count,
             "image_worker_count": worker_count,
             "status_counts": _auto_asset_status_counts(job),
         },
@@ -4273,9 +6538,18 @@ def build_long_video_auto_assets(
         "image_concurrency": image_concurrency,
         "image_worker_count": worker_count,
         "image_request_count": submitted_count,
+        "integrated_frame_request_count": integrated_request_count,
+        "integrated_frame_quality_gate": AUTO_ASSET_QUALITY_GATE_VERSION,
+        "integrated_frame_tasks": integrated_reports,
         "tasks": reports,
         "manifest": str(job.manifest_path),
-        "check": "先检查每个镜头的首中尾源帧、人物图与首尾场景图；确认后再运行自动参考素材打包和视频生成。",
+        "cancelled": cancelled,
+        "asset_stage_status": asset_stage_status,
+        "check": (
+            "检查每个镜头的首尾源帧、人物/场景母版和素材库状态；默认参考包优先发送人物 asset_id 与场景母版。"
+            if not requires_integrated_frames
+            else "检查每个镜头的首尾源帧、人物/场景母版和 approved 整帧图；整帧参考已明确启用。"
+        ),
     }
     return job, json.dumps(report, ensure_ascii=False, indent=2), _auto_asset_preview(job)
 
@@ -4302,6 +6576,17 @@ def _v3_asset_identity(kind: str, item: dict[str, Any], path: Path) -> tuple[str
         verified = f"{place_id}:{version_id}" if place_id and version_id else ""
     content_hash = _file_sha256(path)
     return (f"verified:{kind}:{verified}" if verified else f"hash:{content_hash}", content_hash)
+
+
+def _active_person_asset_id(item: dict[str, Any]) -> str:
+    publication = item.get("publication")
+    if not isinstance(publication, dict):
+        return ""
+    library = publication.get("asset_library")
+    if not isinstance(library, dict) or str(library.get("status") or "").lower() != "active":
+        return ""
+    asset_id = str(library.get("asset_id") or "").strip()
+    return asset_id if asset_id.startswith("asset-") else ""
 
 
 def _v3_labeled_contact_sheet(items: list[dict[str, Any]]) -> torch.Tensor:
@@ -4351,149 +6636,366 @@ def _v3_reference_package_resume_key(tasks: list[dict[str, Any]]) -> str:
     ).hexdigest()
 
 
-def _v3_pack_group_references(job: LongVideoJob) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    previous_resume_key = str(job.manifest.get("reference_package_resume_key") or "")
-    members_by_index = {
-        int(item["index"]): item for item in _auto_asset_member_tasks(job) if isinstance(item, dict)
-    }
-    reports: list[dict[str, Any]] = []
+def _v3_group_pack_context(job: LongVideoJob) -> dict[str, Any]:
+    """Collect the loop-invariant values shared by every request group packing call."""
     options = job.manifest.get("auto_asset_options") or {}
-    visual_style = _normalize_auto_asset_style(options.get("visual_style"))
-    send_source_video = bool(options.get("send_source_video", True))
     is_manual_batch = int(job.manifest.get("processing_contract_version", 0)) == MANUAL_BATCH_PROCESSING_CONTRACT_VERSION
     manual_batch = job.manifest.get("manual_batch") if isinstance(job.manifest.get("manual_batch"), dict) else {}
-    cross_batch_frame = str(manual_batch.get("cross_batch_final_frame") or "")
-    package_version = MANUAL_BATCH_REFERENCE_PACKAGE_VERSION if is_manual_batch else V3_REFERENCE_PACKAGE_VERSION
-    for task in job.manifest["tasks"]:
-        member_ids = list(
-            dict.fromkeys(int(item) for item in task.get("logical_segments", [task.get("logical_segment")]))
-        )
-        members = [members_by_index.get(index) for index in member_ids]
-        if any(member is None or member.get("auto_asset_status") != "ready" for member in members):
-            task["reference_package_status"] = "blocked_by_asset_failure"
-            task["reference_package"] = {"version": package_version, "items": []}
-            task["reference_roles"] = []
-            task["status"] = "blocked_by_asset_failure"
-            reports.append({"index": task["index"], "status": task["reference_package_status"]})
+    return {
+        "members_by_index": {
+            int(item["index"]): item for item in _auto_asset_member_tasks(job) if isinstance(item, dict)
+        },
+        "visual_style": _normalize_auto_asset_style(options.get("visual_style")),
+        "send_source_video": bool(options.get("send_source_video", True)),
+        "is_manual_batch": is_manual_batch,
+        "cross_batch_frame": (
+            str(manual_batch.get("cross_batch_final_frame") or "")
+            if bool(manual_batch.get("cross_batch_continuity"))
+            else ""
+        ),
+        "package_version": MANUAL_BATCH_REFERENCE_PACKAGE_VERSION if is_manual_batch else V3_REFERENCE_PACKAGE_VERSION,
+    }
+
+
+def _reference_timeline_ranges(
+    task: dict[str, Any],
+    member_ids: list[int],
+    members_by_index: dict[int, dict[str, Any]],
+    path_to_package_index: dict[str, int],
+) -> list[dict[str, Any]]:
+    group_start = float(task.get("source_start", task.get("start", 0.0)))
+    timeline_by_index: dict[int, dict[str, Any]] = {}
+    for member_id in member_ids:
+        member = members_by_index.get(member_id)
+        if not isinstance(member, dict):
             continue
-        ready_members = [member for member in members if member is not None]
+        assets = member.get("auto_assets") if isinstance(member.get("auto_assets"), dict) else {}
+        integrated = [
+            item
+            for item in assets.get("integrated_frames", [])
+            if isinstance(item, dict) and (item.get("quality") or {}).get("verdict") == "approved"
+        ]
+        if not integrated:
+            continue
+        start = max(0.0, float(member.get("source_start", member.get("start", 0.0))) - group_start)
+        end = start + float(member.get("source_duration", member.get("duration", 0.0)))
+        ordered_paths = [
+            str(path)
+            for role in ("frame_start", "frame_end")
+            for item in integrated
+            if item.get("role") == role and (path := _asset_path_if_file(item.get("path"))) is not None
+        ]
+        for value in ordered_paths:
+            package_index = path_to_package_index.get(value)
+            if package_index is None:
+                continue
+            entry = timeline_by_index.setdefault(package_index, {"image_index": package_index, "ranges": []})
+            entry["ranges"].append(
+                {
+                    "start": round(start, 6),
+                    "end": round(end, 6),
+                    "logical_segment": member_id,
+                }
+            )
+    return [timeline_by_index[index] for index in sorted(timeline_by_index)]
 
-        unique: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        story_parts: list[str] = []
-        people_descriptions: list[str] = []
-        for member_index, member in zip(member_ids, ready_members, strict=True):
-            analysis = member.get("auto_asset_analysis") or {}
-            story_parts.append(f"镜头 {member_index}：{analysis.get('story_action', '')}")
-            assets = member.get("auto_assets") or {}
-            for category, kind in (("people", "person"), ("scenes", "scene")):
-                for item in assets.get(category, []):
-                    if not isinstance(item, dict):
-                        continue
-                    path = _asset_path_if_file(item.get("path"))
-                    if path is None:
-                        continue
-                    identity, content_hash = _v3_asset_identity(kind, item, path)
-                    if identity in seen or f"hash:{content_hash}" in seen:
-                        continue
-                    seen.update({identity, f"hash:{content_hash}"})
-                    label_id = len(unique) + 1
-                    role = f"person_{label_id}" if kind == "person" else f"scene_{label_id}"
-                    unique.append(
-                        {
-                            "kind": kind,
-                            "role": role,
-                            "label": f"{'PERSON' if kind == 'person' else 'SCENE'}-{label_id:02d}",
-                            "path": str(path),
-                            "identity": identity,
-                            "content_hash": content_hash,
-                        }
-                    )
-                    if kind == "person":
-                        people_descriptions.append(str(item.get("appearance") or "主要人物"))
 
-        root = job.job_dir / "request_groups" / f"group_{int(task['index']):04d}" / "reference_package"
-        root.mkdir(parents=True, exist_ok=True)
-        package: list[dict[str, str]] = []
-        adapter_limit = get_video_engine_adapter(job.engine).reference_image_limit
-        continuity_reserved = int(task["index"]) > 1 or (is_manual_batch and int(task["index"]) == 1 and bool(cross_batch_frame))
-        package_limit = adapter_limit - (1 if continuity_reserved else 0)
-        if len(unique) <= package_limit:
-            package = [{"role": item["role"], "path": item["path"], "label": item["label"]} for item in unique]
+def _evenly_spaced_reference_items(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    if len(items) <= limit:
+        return list(items)
+    if limit == 1:
+        return [items[len(items) // 2]]
+    indexes = [round(index * (len(items) - 1) / (limit - 1)) for index in range(limit)]
+    return [items[index] for index in dict.fromkeys(indexes)]
+
+
+def _select_integrated_reference_items(
+    items: list[dict[str, Any]],
+    *,
+    package_limit: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Keep temporal coverage without reintroducing source or contact-sheet references."""
+    if package_limit <= 0:
+        raise ValueError("Seedance 参考图位置已被连续性参考占满，无法发送合格整帧图。")
+    if len(items) <= package_limit:
+        return list(items), 0
+
+    primary_by_member: dict[int, dict[str, Any]] = {}
+    for item in items:
+        primary_by_member.setdefault(int(item["member_index"]), item)
+    primary = list(primary_by_member.values())
+    selected = _evenly_spaced_reference_items(primary, package_limit)
+    if len(selected) < package_limit:
+        selected_identities = {str(item["identity"]) for item in selected}
+        remaining = [item for item in items if str(item["identity"]) not in selected_identities]
+        selected.extend(remaining[: package_limit - len(selected)])
+    selected.sort(key=lambda item: int(item["temporal_order"]))
+    return selected, len(items) - len(selected)
+
+
+def _v3_pack_single_group_reference(
+    job: LongVideoJob,
+    task: dict[str, Any],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    """Pack the reference package for one request group and return its report entry."""
+    members_by_index = context["members_by_index"]
+    visual_style = context["visual_style"]
+    send_source_video = context["send_source_video"]
+    is_manual_batch = context["is_manual_batch"]
+    cross_batch_frame = context["cross_batch_frame"]
+    package_version = context["package_version"]
+    options = job.manifest.get("auto_asset_options") or {}
+    use_integrated_frame_references = bool(options.get("use_integrated_frame_references", False))
+
+    member_ids = list(
+        dict.fromkeys(int(item) for item in task.get("logical_segments", [task.get("logical_segment")]))
+    )
+    members = [members_by_index.get(index) for index in member_ids]
+    if any(member is None or member.get("auto_asset_status") != "ready" for member in members):
+        task["reference_package_status"] = "blocked_by_asset_failure"
+        task["reference_package"] = {"version": package_version, "items": []}
+        task["reference_roles"] = []
+        task["status"] = "blocked_by_asset_failure"
+        return {"index": task["index"], "status": task["reference_package_status"]}
+    ready_members = [member for member in members if member is not None]
+
+    master_items: list[dict[str, Any]] = []
+    integrated_items: list[dict[str, Any]] = []
+    seen_master_asset_ids: set[str] = set()
+    seen_master_content_hashes: set[str] = set()
+    seen_integrated: set[str] = set()
+    story_parts: list[str] = []
+    people_descriptions: list[str] = []
+    for member_index, member in zip(member_ids, ready_members, strict=True):
+        analysis = member.get("auto_asset_analysis") or {}
+        story_parts.append(f"镜头 {member_index}：{analysis.get('story_action', '')}")
+        assets = member.get("auto_assets") or {}
+        people = [item for item in assets.get("people", []) if isinstance(item, dict)]
+        for person in sorted(people, key=lambda item: 0 if _active_person_asset_id(item) else 1):
+            people_descriptions.append(str(person.get("appearance") or "主要人物"))
+            asset_id = _active_person_asset_id(person)
+            path = _asset_path_if_file(person.get("path"))
+            if not asset_id and path is None:
+                continue
+            content_hash = _file_sha256(path) if path is not None else ""
+            identity = f"asset:{asset_id}" if asset_id else f"hash:{content_hash}"
+            if (
+                (asset_id and asset_id in seen_master_asset_ids)
+                or (content_hash and content_hash in seen_master_content_hashes)
+            ):
+                continue
+            if asset_id:
+                seen_master_asset_ids.add(asset_id)
+            if content_hash:
+                seen_master_content_hashes.add(content_hash)
+            master_items.append(
+                {
+                    "kind": "person_asset",
+                    "source_role": str(person.get("slot") or "person"),
+                    "member_index": member_index,
+                    "temporal_order": len(master_items),
+                    "path": str(path) if path is not None else "",
+                    "asset_id": asset_id,
+                    "identity": identity,
+                    "content_hash": content_hash,
+                    "reused_from_cache": bool(person.get("reused_from_cache")),
+                }
+            )
+        for scene in assets.get("scenes", []):
+            if not isinstance(scene, dict):
+                continue
+            path = _asset_path_if_file(scene.get("style_master_path")) or _asset_path_if_file(scene.get("path"))
+            if path is None:
+                continue
+            content_hash = _file_sha256(path)
+            identity = f"hash:{content_hash}"
+            if content_hash in seen_master_content_hashes:
+                continue
+            seen_master_content_hashes.add(content_hash)
+            master_items.append(
+                {
+                    "kind": "scene_master",
+                    "source_role": str(scene.get("role") or "scene"),
+                    "member_index": member_index,
+                    "temporal_order": len(master_items),
+                    "path": str(path),
+                    "asset_id": "",
+                    "identity": identity,
+                    "content_hash": content_hash,
+                    "reused_from_cache": bool(scene.get("reused_from_cache")),
+                }
+            )
+        if not use_integrated_frame_references:
+            continue
+        integrated = [
+            item
+            for item in assets.get("integrated_frames", [])
+            if isinstance(item, dict) and (item.get("quality") or {}).get("verdict") == "approved"
+        ]
+        integrated.sort(key=lambda item: 0 if item.get("role") == "frame_start" else 1)
+        for item in integrated:
+            path = _asset_path_if_file(item.get("path"))
+            if path is None:
+                continue
+            content_hash = _file_sha256(path)
+            identity = f"hash:{content_hash}"
+            if identity in seen_integrated:
+                continue
+            seen_integrated.add(identity)
+            integrated_items.append(
+                {
+                    "kind": "integrated_frame",
+                    "source_role": str(item.get("role") or "frame_start"),
+                    "member_index": member_index,
+                    "temporal_order": len(integrated_items),
+                    "path": str(path),
+                    "asset_id": "",
+                    "identity": identity,
+                    "content_hash": content_hash,
+                    "quality": dict(item.get("quality") or {}),
+                }
+            )
+
+    root = job.job_dir / "request_groups" / f"group_{int(task['index']):04d}" / "reference_package"
+    root.mkdir(parents=True, exist_ok=True)
+    package: list[dict[str, Any]] = []
+    adapter_limit = get_video_engine_adapter(job.engine).reference_image_limit
+    uses_previous_end_frame = bool(task.get("continuity_from_previous_group"))
+    uses_cross_batch_frame = is_manual_batch and int(task["index"]) == 1 and bool(cross_batch_frame)
+    continuity_reserved = uses_previous_end_frame or uses_cross_batch_frame
+    package_limit = adapter_limit - (1 if continuity_reserved else 0)
+    if package_limit <= 0:
+        raise ValueError("Seedance 参考图位置已被连续性参考占满，无法发送人物或场景素材。")
+    ordered_master_items = sorted(
+        master_items,
+        key=lambda item: (0 if item["kind"] == "person_asset" else 1, int(item["temporal_order"])),
+    )
+    selected_masters = list(ordered_master_items[:package_limit])
+    remaining_limit = package_limit - len(selected_masters)
+    selected_integrated, omitted_integrated_count = _select_integrated_reference_items(
+        integrated_items,
+        package_limit=remaining_limit,
+    ) if use_integrated_frame_references and remaining_limit > 0 else ([], len(integrated_items))
+    selected = [*selected_masters, *selected_integrated]
+    omitted_master_count = max(0, len(ordered_master_items) - len(selected_masters))
+    package = []
+    person_index = 0
+    scene_index = 0
+    integrated_index = 0
+    for item in selected:
+        kind = str(item["kind"])
+        if kind == "person_asset":
+            person_index += 1
+            role = f"person_{person_index}"
+            label = f"PERSON-{person_index:02d}"
+        elif kind == "scene_master":
+            scene_index += 1
+            role = f"scene_{scene_index}"
+            label = f"SCENE-{scene_index:02d}"
         else:
-            sheets: list[tuple[str, list[dict[str, Any]]]] = []
-            for kind in ("person", "scene"):
-                values = [item for item in unique if item["kind"] == kind]
-                for offset in range(0, len(values), V3_CONTACT_SHEET_ITEMS):
-                    sheets.append((kind, values[offset : offset + V3_CONTACT_SHEET_ITEMS]))
-            if len(sheets) > package_limit:
-                labels = ", ".join(item["label"] for item in unique)
-                raise ValueError(
-                    f"第 {task['index']} 组共有 {len(unique)} 个唯一资源，"
-                    f"{package_limit} 张可读拼图仍无法容纳：{labels}"
-                )
-            for sheet_index, (kind, values) in enumerate(sheets, start=1):
-                role = f"{kind}_contact_sheet_{sheet_index}"
-                path = root / f"{role}.png"
-                package.append(
-                    {
-                        "role": role,
-                        "path": _save_reference_package_image(_v3_labeled_contact_sheet(values), path),
-                        "label": "+".join(item["label"] for item in values),
-                    }
-                )
+            integrated_index += 1
+            role = f"integrated_frame_{integrated_index}"
+            label = f"FRAME-{integrated_index:02d}"
+        package_item = {
+            "role": role,
+            "kind": kind,
+            "path": item["path"],
+            "label": label,
+            "source_role": item["source_role"],
+            "logical_segment": item["member_index"],
+            "reused_from_cache": bool(item.get("reused_from_cache")),
+        }
+        if item.get("asset_id"):
+            package_item["asset_id"] = item["asset_id"]
+        if kind == "integrated_frame":
+            package_item["quality"] = item["quality"]
+        package.append(package_item)
 
-        roles = [item["role"] for item in package]
-        group_analysis = {
-            "story_action": "；".join(story_parts),
-            "people": [{"appearance": value} for value in dict.fromkeys(people_descriptions)],
-        }
-        task["auto_asset_analysis"] = group_analysis
-        task["prompt"] = _build_auto_asset_video_prompt(
-            job.prompt,
-            group_analysis,
-            reference_roles=roles,
-            soft_continuity=int(task["index"]) > 1,
-            visual_style=visual_style,
-            send_source_video=send_source_video,
-        )
-        package_key_source = {
-            "version": package_version,
-            "logical_segments": member_ids,
-            "analysis": group_analysis,
-            "prompt": task["prompt"],
-            "assets": [
-                {"identity": item["identity"], "content_hash": item["content_hash"]} for item in unique
-            ],
-        }
-        package_key = hashlib.sha256(
-            json.dumps(package_key_source, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        ).hexdigest()
-        task["reference_package"] = {
-            "version": package_version,
-            "package_key": package_key,
-            "items": package,
-            "unique_asset_count": len(unique),
-            "asset_hashes": [item["content_hash"] for item in unique],
-            "logical_segments": member_ids,
-            "reserved_continuity_slots": adapter_limit - package_limit,
-        }
-        task["reference_roles"] = roles
-        task["reference_package_status"] = "ready" if package else "empty"
-        if package and task.get("generated_reference_package_key") == package_key:
-            task["status"] = "success"
-            task.pop("resume_invalidated", None)
-        else:
-            task["status"] = "matched" if package else "auto_asset_failed"
-        reports.append(
+    roles = [item["role"] for item in package]
+    group_analysis = {
+        "story_action": "；".join(story_parts),
+        "people": [{"appearance": value} for value in dict.fromkeys(people_descriptions)],
+    }
+    path_to_package_index = {
+        str(Path(item["path"])): index
+        for index, item in enumerate(package, start=1)
+        if item.get("kind") == "integrated_frame" and item.get("path")
+    }
+    reference_timeline = _reference_timeline_ranges(task, member_ids, members_by_index, path_to_package_index)
+    task["auto_asset_analysis"] = group_analysis
+    task["prompt"] = _build_auto_asset_video_prompt(
+        job.prompt,
+        group_analysis,
+        reference_roles=roles,
+        soft_continuity=continuity_reserved,
+        visual_style=visual_style,
+        send_source_video=send_source_video,
+        reference_timeline=reference_timeline,
+    )
+    package_key_source = {
+        "version": package_version,
+        "logical_segments": member_ids,
+        "analysis": group_analysis,
+        "prompt": task["prompt"],
+        "assets": [
             {
-                "index": task["index"],
-                "status": task["reference_package_status"],
-                "logical_segments": member_ids,
-                "unique_assets": len(unique),
-                "roles": roles,
+                "identity": item["identity"],
+                "content_hash": item["content_hash"],
+                "asset_id": item.get("asset_id") or "",
+                "kind": item["kind"],
+                "quality": item.get("quality") or {},
             }
-        )
+            for item in selected
+        ],
+    }
+    package_key = hashlib.sha256(
+        json.dumps(package_key_source, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    task["reference_package"] = {
+        "version": package_version,
+        "package_key": package_key,
+        "items": package,
+        "unique_asset_count": len(master_items) + len(integrated_items),
+        "packed_asset_count": len(selected),
+        "omitted_master_count": omitted_master_count,
+        "omitted_integrated_frame_count": omitted_integrated_count,
+        "asset_hashes": [item["content_hash"] for item in selected if item["content_hash"]],
+        "asset_ids": [item["asset_id"] for item in selected if item.get("asset_id")],
+        "uses_integrated_frame_references": use_integrated_frame_references,
+        "logical_segments": member_ids,
+        "reference_timeline": reference_timeline,
+        "reserved_continuity_slots": adapter_limit - package_limit,
+    }
+    task["reference_roles"] = roles
+    task["reference_package_status"] = "ready" if package else "empty"
+    task["uses_previous_end_frame"] = continuity_reserved
+    if package and task.get("generated_reference_package_key") == package_key:
+        task["status"] = "success"
+        task.pop("resume_invalidated", None)
+    else:
+        task["status"] = "matched" if package else "auto_asset_failed"
+    return {
+        "index": task["index"],
+        "status": task["reference_package_status"],
+        "logical_segments": member_ids,
+        "unique_assets": len(master_items) + len(integrated_items),
+        "packed_assets": len(selected),
+        "omitted_masters": omitted_master_count,
+        "omitted_integrated_frames": omitted_integrated_count,
+        "uses_integrated_frames": use_integrated_frame_references,
+        "roles": roles,
+    }
+
+
+def _v3_pack_group_references(job: LongVideoJob) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    previous_resume_key = str(job.manifest.get("reference_package_resume_key") or "")
+    context = _v3_group_pack_context(job)
+    reports: list[dict[str, Any]] = [
+        _v3_pack_single_group_reference(job, task, context) for task in job.manifest["tasks"]
+    ]
     tasks = job.manifest["tasks"]
     current_resume_key = _v3_reference_package_resume_key(tasks)
     if previous_resume_key and previous_resume_key != current_resume_key:
@@ -5092,6 +7594,92 @@ def _rebase_auto_asset_paths(value: Any, *, old_root: Path, new_root: Path) -> A
     return value
 
 
+def _manual_batch_retry_assets_compatible(
+    candidate: dict[str, Any],
+    *,
+    values: dict[str, Any],
+    segmentation: dict[str, Any],
+    processing_contract_version: int,
+) -> bool:
+    if int(candidate.get("processing_contract_version", 0)) != int(processing_contract_version):
+        return False
+    if candidate.get("asset_mode") != "auto_shot_assets":
+        return False
+    candidate_settings = candidate.get("settings") if isinstance(candidate.get("settings"), dict) else {}
+    for field in ("engine", "model", "prompt", "negative_prompt", "ai_model"):
+        if candidate_settings.get(field) != values.get(field):
+            return False
+    candidate_options = dict(candidate.get("auto_asset_options") or {})
+    current_options = dict(values.get("auto_asset_options") or {})
+    candidate_options.pop("manual_batch", None)
+    current_options.pop("manual_batch", None)
+    candidate_options.pop("force_rerun_assets", None)
+    current_options.pop("force_rerun_assets", None)
+    if candidate_options != current_options:
+        return False
+    candidate_segmentation = candidate.get("segmentation") if isinstance(candidate.get("segmentation"), dict) else {}
+    return (
+        candidate_segmentation.get("boundaries_hash") == segmentation.get("boundaries_hash")
+        and candidate_segmentation.get("effective_mode") == segmentation.get("effective_mode")
+    )
+
+
+def _inherit_manual_batch_retry_asset_root(
+    *,
+    old_job_dir: Path,
+    new_job_dir: Path,
+    task: dict[str, Any],
+    reuse_threshold: float = AUTO_ASSET_DEFAULT_REUSE_THRESHOLD,
+) -> None:
+    old_root = old_job_dir / "shot_assets" / f"shot_{int(task['index']):04d}"
+    new_root = new_job_dir / "shot_assets" / f"shot_{int(task['index']):04d}"
+    if not old_root.is_dir() or old_root == new_root:
+        return
+    shutil.copytree(old_root, new_root, dirs_exist_ok=True)
+    for key in (
+        "auto_asset_analysis",
+        "auto_assets",
+        "auto_asset_errors",
+        "auto_asset_warnings",
+        "auto_asset_suspected_matches",
+    ):
+        if key in task:
+            task[key] = _rebase_auto_asset_paths(task[key], old_root=old_root, new_root=new_root)
+    task["auto_asset_reused_from"] = str(old_root)
+    _reset_manual_batch_quality_retry_state(task, new_root, reuse_threshold=reuse_threshold)
+    _write_auto_asset_manifest(new_root, task)
+
+
+def _reset_manual_batch_quality_retry_state(
+    task: dict[str, Any],
+    root: Path,
+    *,
+    reuse_threshold: float,
+) -> bool:
+    """Reopen only a retry whose base masters are intact and frame quality failed."""
+    if task.get("auto_asset_status") not in {"degraded", "failed"}:
+        return False
+    errors = task.get("auto_asset_errors") if isinstance(task.get("auto_asset_errors"), list) else []
+    if not errors or any(str(item.get("kind") or "") != "integrated_frame" for item in errors if isinstance(item, dict)):
+        return False
+    if any(not isinstance(item, dict) or str(item.get("error_kind") or "") not in {
+        "quality_gate_failed",
+        "generation_or_quality_failed",
+    } for item in errors):
+        return False
+    if not _auto_asset_task_masters_complete(task, root, reuse_threshold=reuse_threshold):
+        return False
+    assets = task.get("auto_assets")
+    if isinstance(assets, dict):
+        # The old candidates are retained on disk for inspection, but are not
+        # eligible for packing after a retry starts.
+        assets["integrated_frames"] = []
+    task["auto_asset_errors"] = []
+    task["auto_asset_status"] = "masters_ready"
+    task["auto_asset_retry_reason"] = "integrated_frame_quality_gate"
+    return True
+
+
 def plan_long_video_job(
     *,
     video: Any,
@@ -5243,7 +7831,13 @@ def plan_long_video_job(
             new_root = job_dir / "shot_assets" / f"shot_{index:04d}"
             if old_root and old_root.is_dir() and (old_root / "manifest.json").is_file():
                 shutil.copytree(old_root, new_root, dirs_exist_ok=True)
-                for key in ("auto_asset_analysis", "auto_assets", "auto_asset_errors", "auto_asset_status"):
+                for key in (
+                    "auto_asset_analysis",
+                    "auto_assets",
+                    "auto_asset_errors",
+                    "auto_asset_warnings",
+                    "auto_asset_status",
+                ):
                     if key in previous:
                         task[key] = _rebase_auto_asset_paths(previous[key], old_root=old_root, new_root=new_root)
                 task["auto_asset_reused_from"] = str(old_root)
@@ -5315,7 +7909,9 @@ def plan_long_video_auto_asset_job(
     target_resource_type: str = "",
     processing_contract_version: int = 0,
     use_original_audio: bool = True,
+    use_integrated_frame_references: bool = False,
     manual_batch: dict[str, Any] | None = None,
+    identity_mapping: Any = "",
 ) -> LongVideoJob:
     options = {
         "image_model": str(image_model or "gpt-image-2"),
@@ -5327,6 +7923,7 @@ def plan_long_video_auto_asset_job(
         "max_people_per_shot": AUTO_ASSET_MAX_PEOPLE,
         "visual_style": _normalize_auto_asset_style(visual_style),
         "send_source_video": bool(send_source_video),
+        "use_integrated_frame_references": bool(use_integrated_frame_references),
         "target_resource_type": str(target_resource_type or ""),
     }
     contract_version = int(processing_contract_version)
@@ -5345,6 +7942,13 @@ def plan_long_video_auto_asset_job(
         )
         if contract_version == MANUAL_BATCH_PROCESSING_CONTRACT_VERSION:
             options["manual_batch"] = dict(manual_batch or {})
+        normalized_identity_mapping = _load_identity_mapping(identity_mapping)
+        if (
+            normalized_identity_mapping["global_people"]
+            or normalized_identity_mapping["shot_people"]
+            or normalized_identity_mapping["expected_distinct_people"]
+        ):
+            options["identity_mapping"] = normalized_identity_mapping
     auto_assets = LongVideoAssets(
         manifest={
             "version": 1,
@@ -5465,6 +8069,7 @@ def plan_long_video_auto_asset_v3_job(
 
     manifest_path = job_dir / "manifest.json"
     existing = None
+    resumed_from_manifest = ""
     if resume and not force_rerun and manifest_path.is_file():
         try:
             candidate = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -5473,8 +8078,39 @@ def plan_long_video_auto_asset_v3_job(
                 and int(candidate.get("processing_contract_version", 0)) == int(processing_contract_version)
             ):
                 existing = candidate
+                resumed_from_manifest = str(manifest_path)
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             existing = None
+
+    retry_source_job_dir: Path | None = None
+    if (
+        existing is None
+        and resume
+        and not force_rerun
+        and int(processing_contract_version) == MANUAL_BATCH_PROCESSING_CONTRACT_VERSION
+    ):
+        retry_candidate = _manual_batch_retry_manifest(manual_batch)
+        if retry_candidate is not None:
+            candidate, candidate_path = retry_candidate
+            if _manual_batch_retry_assets_compatible(
+                candidate,
+                values=values,
+                segmentation=segmentation,
+                processing_contract_version=processing_contract_version,
+            ):
+                existing = candidate
+                resumed_from_manifest = str(candidate_path)
+                retry_source_job_dir = candidate_path.parent
+                source_cache = retry_source_job_dir / "asset_cache" / "index.json"
+                if source_cache.is_file():
+                    try:
+                        cache = json.loads(source_cache.read_text(encoding="utf-8"))
+                        _atomic_write_json(
+                            job_dir / "asset_cache" / "index.json",
+                            _rebase_auto_asset_paths(cache, old_root=retry_source_job_dir, new_root=job_dir),
+                        )
+                    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                        logging.warning("Unable to inherit auto asset cache for manual batch retry.", exc_info=True)
 
     existing_members = {
         int(item["index"]): item
@@ -5487,6 +8123,13 @@ def plan_long_video_auto_asset_v3_job(
         previous = existing_members.get(member.index)
         if previous and not force_rerun and _task_source_timing_matches(previous, task):
             task.update(previous)
+            if retry_source_job_dir is not None:
+                _inherit_manual_batch_retry_asset_root(
+                    old_job_dir=retry_source_job_dir,
+                    new_job_dir=job_dir,
+                    task=task,
+                    reuse_threshold=float((auto_asset_options or {}).get("reuse_threshold", AUTO_ASSET_DEFAULT_REUSE_THRESHOLD)),
+                )
         member_tasks.append(task)
 
     existing_groups = {
@@ -5495,17 +8138,21 @@ def plan_long_video_auto_asset_v3_job(
         if isinstance(item, dict) and item.get("index") is not None
     }
     tasks = []
+    previous_group: RequestSegment | None = None
     for group in groups:
         task = {
             **group.to_dict(),
             "status": "planned",
             "attempts": 0,
             "result": str(job_dir / "segments" / f"segment_{group.index:04d}.mp4"),
+            "continuity_from_previous_group": _request_group_continues_same_logical_shot(previous_group, group),
         }
         previous = existing_groups.get(group.index)
         if previous and not force_rerun and _task_timing_matches(previous, task):
             task.update(previous)
+        task["continuity_from_previous_group"] = _request_group_continues_same_logical_shot(previous_group, group)
         tasks.append(task)
+        previous_group = group
 
     manifest = {
         "version": AUTO_ASSET_MANIFEST_VERSION + 1,
@@ -5517,7 +8164,7 @@ def plan_long_video_auto_asset_v3_job(
         "engine": engine,
         "model": model,
         "segment_duration": int(shot_plan.fixed_duration),
-        "continuity": "soft_previous_end_frame",
+        "continuity": "same_logical_shot_only",
         "status": "planned",
         "assets": assets.manifest,
         "asset_mode": "auto_shot_assets",
@@ -5530,6 +8177,8 @@ def plan_long_video_auto_asset_v3_job(
     if int(processing_contract_version) == MANUAL_BATCH_PROCESSING_CONTRACT_VERSION:
         manifest["batch_contract"] = MANUAL_BATCH_CONTRACT
         manifest["manual_batch"] = dict(manual_batch or {})
+    if resumed_from_manifest and Path(resumed_from_manifest) != manifest_path:
+        manifest["resumed_from_manifest"] = resumed_from_manifest
     if existing and not force_rerun and "reference_package_resume_key" in existing:
         manifest["reference_package_resume_key"] = existing["reference_package_resume_key"]
     if existing and not force_rerun and "output_geometry" in existing:
@@ -5623,11 +8272,17 @@ def _references_from_auto_package(
     for item in package.get("items", []):
         if not isinstance(item, dict):
             continue
+        role = str(item.get("role") or "auto_asset")
+        asset_id = str(item.get("asset_id") or "").strip()
+        if adapter.key == "seedance" and asset_id.startswith("asset-"):
+            images.append(SeedanceAssetReference(asset_id=asset_id, role=role))
+            roles.append(role)
+            continue
         path = _asset_path_if_file(item.get("path"))
         if path is None:
             continue
         images.append(_load_image_file(path))
-        roles.append(str(item.get("role") or "auto_asset"))
+        roles.append(role)
     if previous_end_frame is not None:
         images.append(previous_end_frame)
         roles.append(continuity_role)
@@ -6000,20 +8655,21 @@ def generate_long_video_segments_parallel(job: LongVideoJob, concurrency: int = 
     return job
 
 
-def generate_long_video_segments(job: LongVideoJob) -> LongVideoJob:
-    adapter = get_video_engine_adapter(job.engine)
+def _segment_generation_context(job: LongVideoJob) -> dict[str, Any]:
+    """Prepare the loop-invariant context shared by sequential and pipeline segment generation."""
     options = job.manifest.get("auto_asset_options", {})
     options = options if isinstance(options, dict) else {}
-    send_source_video = bool(options.get("send_source_video", True))
     seedance_contract = int(job.manifest.get("processing_contract_version", 0)) in {
         V3_PROCESSING_CONTRACT_VERSION,
         MANUAL_BATCH_PROCESSING_CONTRACT_VERSION,
     }
     is_manual_batch = int(job.manifest.get("processing_contract_version", 0)) == MANUAL_BATCH_PROCESSING_CONTRACT_VERSION
-    use_original_audio = bool(options.get("use_original_audio", True)) if seedance_contract else True
     manual_batch = job.manifest.get("manual_batch") if isinstance(job.manifest.get("manual_batch"), dict) else {}
-    cross_batch_path = _asset_path_if_file(manual_batch.get("cross_batch_final_frame")) if is_manual_batch else None
-    cross_batch_frame = _load_image_file(cross_batch_path) if cross_batch_path else None
+    cross_batch_path = (
+        _asset_path_if_file(manual_batch.get("cross_batch_final_frame"))
+        if is_manual_batch and bool(manual_batch.get("cross_batch_continuity"))
+        else None
+    )
     state_path = (
         _manual_batch_validate_state_path(str(manual_batch.get("series_id") or ""), str(manual_batch.get("state_path")))
         if is_manual_batch and manual_batch.get("state_path")
@@ -6029,173 +8685,409 @@ def generate_long_video_segments(job: LongVideoJob) -> LongVideoJob:
         _manual_batch_write_state(state_path, state)
     else:
         state = None
-    previous_end_frame = None
+    return {
+        "adapter": get_video_engine_adapter(job.engine),
+        "options": options,
+        "send_source_video": bool(options.get("send_source_video", True)),
+        "seedance_contract": seedance_contract,
+        "is_manual_batch": is_manual_batch,
+        "use_original_audio": bool(options.get("use_original_audio", True)) if seedance_contract else True,
+        "cross_batch_frame": _load_image_file(cross_batch_path) if cross_batch_path else None,
+        "state_path": state_path,
+        "state": state,
+    }
+
+
+def _generate_single_group_segment(
+    job: LongVideoJob,
+    task: dict[str, Any],
+    context: dict[str, Any],
+    *,
+    previous_end_frame: Any,
+) -> Any:
+    """Generate the video for one request group and return its end frame for continuity."""
+    adapter = context["adapter"]
+    options = context["options"]
+    send_source_video = context["send_source_video"]
+    seedance_contract = context["seedance_contract"]
+    is_manual_batch = context["is_manual_batch"]
+    use_original_audio = context["use_original_audio"]
+    cross_batch_frame = context["cross_batch_frame"]
+    state_path = context["state_path"]
+    state = context["state"]
     output_geometry = job.manifest.get("output_geometry")
-    progress = ProgressBar(len(job.manifest["tasks"]))
-    for task in job.manifest["tasks"]:
-        segment_path = Path(task["result"])
-        can_reuse_result = (
-            job.resume
-            and not job.force_rerun
-            and task.get("status") == "success"
-            and segment_path.is_file()
+
+    segment_path = Path(task["result"])
+    can_reuse_result = (
+        job.resume
+        and not job.force_rerun
+        and task.get("status") == "success"
+        and segment_path.is_file()
+    )
+    if seedance_contract:
+        package = task.get("reference_package") or {}
+        package_key = str(package.get("package_key") or "") if isinstance(package, dict) else ""
+        can_reuse_result = bool(
+            can_reuse_result
+            and package_key
+            and task.get("generated_reference_package_key") == package_key
         )
-        if seedance_contract:
-            package = task.get("reference_package") or {}
-            package_key = str(package.get("package_key") or "") if isinstance(package, dict) else ""
-            can_reuse_result = bool(
-                can_reuse_result
-                and package_key
-                and task.get("generated_reference_package_key") == package_key
-            )
-        if can_reuse_result:
-            previous_end_frame = _last_frame(segment_path)
-            progress.update(1)
-            continue
-        source_segment = _source_segment_for_task(job, task) if send_source_video else None
-        if send_source_video and source_segment is None:
-            raise ValueError(f"第 {task['index']} 段无法读取原视频画面。")
-        if job.manifest.get("asset_mode") == "auto_shot_assets":
-            if task.get("reference_package_status") != "ready":
-                raise ValueError(f"第 {task['index']} 段自动参考素材不可用，状态为 {task.get('reference_package_status')}。")
-            continuity_frame = cross_batch_frame if is_manual_batch and int(task["index"]) == 1 else previous_end_frame
-            continuity_role = "cross_batch_final_frame" if is_manual_batch and int(task["index"]) == 1 else "previous_segment_end_frame"
-            references, roles = _references_from_auto_package(
-                adapter,
-                task,
-                previous_end_frame=continuity_frame,
-                continuity_role=continuity_role,
-            )
+    if can_reuse_result:
+        return _last_frame(segment_path)
+    source_segment = _source_segment_for_task(job, task) if send_source_video else None
+    if send_source_video and source_segment is None:
+        raise ValueError(f"第 {task['index']} 段无法读取原视频画面。")
+    if job.manifest.get("asset_mode") == "auto_shot_assets":
+        if task.get("reference_package_status") != "ready":
+            raise ValueError(f"第 {task['index']} 段自动参考素材不可用，状态为 {task.get('reference_package_status')}。")
+        if is_manual_batch and int(task["index"]) == 1 and cross_batch_frame is not None:
+            continuity_frame = cross_batch_frame
+            continuity_role = "cross_batch_final_frame"
+        elif bool(task.get("continuity_from_previous_group")):
+            continuity_frame = previous_end_frame
+            continuity_role = "previous_segment_end_frame"
         else:
-            selected = task.get("selected_assets")
-            if not isinstance(selected, dict):
-                raise ValueError(f"第 {task['index']} 段尚未完成参考素材匹配。")
-            selected_people = [job.assets.people[item] for item in selected["people"] if item in job.assets.people]
-            selected_backgrounds = [job.assets.backgrounds[item] for item in selected["backgrounds"] if item in job.assets.backgrounds]
-            references, roles = _reference_images_for_task(
-                adapter,
-                selected_people=selected_people,
-                selected_backgrounds=selected_backgrounds,
-                previous_end_frame=previous_end_frame,
+            continuity_frame = None
+            continuity_role = "previous_segment_end_frame"
+        references, roles = _references_from_auto_package(
+            adapter,
+            task,
+            previous_end_frame=continuity_frame,
+            continuity_role=continuity_role,
+        )
+    else:
+        selected = task.get("selected_assets")
+        if not isinstance(selected, dict):
+            raise ValueError(f"第 {task['index']} 段尚未完成参考素材匹配。")
+        selected_people = [job.assets.people[item] for item in selected["people"] if item in job.assets.people]
+        selected_backgrounds = [job.assets.backgrounds[item] for item in selected["backgrounds"] if item in job.assets.backgrounds]
+        references, roles = _reference_images_for_task(
+            adapter,
+            selected_people=selected_people,
+            selected_backgrounds=selected_backgrounds,
+            previous_end_frame=previous_end_frame,
+        )
+    task["reference_roles"] = roles
+    task["source_video_sent"] = send_source_video
+    include_source_video = send_source_video
+    privacy_fallback_used = False
+    last_error = ""
+    normal_attempts = max(1, job.max_retries + 1)
+    for attempt in range(1, normal_attempts + 2):
+        task["attempts"] = attempt
+        task["status"] = "running"
+        try:
+            request_duration = float(task.get("request_duration", task["duration"]))
+            generate_kwargs = {
+                "source_segment": source_segment,
+                "references": references,
+                "prompt": task["prompt"],
+                "model": job.model,
+                "duration": request_duration,
+                "negative_prompt": job.negative_prompt,
+                "include_source_video": include_source_video,
+            }
+            if seedance_contract:
+                generate_kwargs["generate_audio"] = not use_original_audio
+            _, remote_path = adapter.generate(
+                **generate_kwargs,
             )
-        task["reference_roles"] = roles
-        task["source_video_sent"] = send_source_video
-        include_source_video = send_source_video
-        privacy_fallback_used = False
-        last_error = ""
-        normal_attempts = max(1, job.max_retries + 1)
-        for attempt in range(1, normal_attempts + 2):
-            task["attempts"] = attempt
-            task["status"] = "running"
-            try:
-                request_duration = float(task.get("request_duration", task["duration"]))
-                generate_kwargs = {
-                    "source_segment": source_segment,
-                    "references": references,
-                    "prompt": task["prompt"],
-                    "model": job.model,
-                    "duration": request_duration,
-                    "negative_prompt": job.negative_prompt,
-                    "include_source_video": include_source_video,
-                }
-                if seedance_contract:
-                    generate_kwargs["generate_audio"] = not use_original_audio
-                _, remote_path = adapter.generate(
-                    **generate_kwargs,
+            remote_path = Path(remote_path)
+            if not output_geometry:
+                width, height, fps = _video_geometry(remote_path)
+                output_geometry = {"width": width, "height": height, "fps": fps}
+                job.manifest["output_geometry"] = output_geometry
+            if seedance_contract:
+                task["media"] = _normalize_segment_v3(
+                    remote_path,
+                    segment_path,
+                    request_duration=request_duration,
+                    width=int(output_geometry["width"]),
+                    height=int(output_geometry["height"]),
+                    fps=float(output_geometry["fps"]),
+                    keep_generated_audio=not use_original_audio,
                 )
-                remote_path = Path(remote_path)
-                if not output_geometry:
-                    width, height, fps = _video_geometry(remote_path)
-                    output_geometry = {"width": width, "height": height, "fps": fps}
-                    job.manifest["output_geometry"] = output_geometry
-                if seedance_contract:
-                    task["media"] = _normalize_segment_v3(
-                        remote_path,
-                        segment_path,
-                        request_duration=request_duration,
-                        width=int(output_geometry["width"]),
-                        height=int(output_geometry["height"]),
-                        fps=float(output_geometry["fps"]),
-                        keep_generated_audio=not use_original_audio,
-                    )
-                else:
-                    _normalize_segment(
-                        remote_path,
-                        segment_path,
-                        duration=task["duration"],
-                        width=int(output_geometry["width"]),
-                        height=int(output_geometry["height"]),
-                        fps=float(output_geometry["fps"]),
-                        trim_offset=float(task.get("trim_offset", 0.0)),
-                    )
-                task["status"] = "success"
-                task["error"] = ""
-                task["source_video_sent"] = include_source_video
-                if seedance_contract:
-                    task["generated_reference_package_key"] = str(
-                        (task.get("reference_package") or {}).get("package_key") or ""
-                    )
-                previous_end_frame = _last_frame(segment_path)
-                break
-            except Exception as exc:
-                last_error = str(exc)
-                task["error"] = last_error
-                if include_source_video and _real_person_privacy_error(exc) and not privacy_fallback_used:
-                    privacy_fallback_used = True
-                    include_source_video = False
-                    task["status"] = "retrying_without_source_video"
-                    task["source_video_sent"] = False
-                    task["privacy_fallback"] = {
-                        "used": True,
-                        "reason": "real_person_privacy_detected",
-                        "original_error": last_error,
-                        "fallback": "reference_images_and_story_text_only",
-                    }
-                    task["prompt"] = _build_auto_asset_video_prompt(
-                        job.prompt,
-                        task.get("auto_asset_analysis", {}),
-                        reference_roles=roles,
-                        soft_continuity=int(task["index"]) > 1,
-                        visual_style=str(options.get("visual_style") or AUTO_ASSET_STYLE_WESTERN),
-                        send_source_video=False,
-                    )
-                    _atomic_write_json(job.manifest_path, job.manifest)
-                    continue
-                if _provider_policy_error(exc):
-                    task["status"] = "blocked_by_provider_policy"
-                    task["failure_kind"] = "provider_policy"
-                    _atomic_write_json(job.manifest_path, job.manifest)
-                    break
-                if privacy_fallback_used:
-                    task["status"] = "failed"
-                    _atomic_write_json(job.manifest_path, job.manifest)
-                    break
-                task["status"] = "retrying" if attempt <= job.max_retries else "failed"
+            else:
+                _normalize_segment(
+                    remote_path,
+                    segment_path,
+                    duration=task["duration"],
+                    width=int(output_geometry["width"]),
+                    height=int(output_geometry["height"]),
+                    fps=float(output_geometry["fps"]),
+                    trim_offset=float(task.get("trim_offset", 0.0)),
+                )
+            task["status"] = "success"
+            task["error"] = ""
+            task["source_video_sent"] = include_source_video
+            if seedance_contract:
+                task["generated_reference_package_key"] = str(
+                    (task.get("reference_package") or {}).get("package_key") or ""
+                )
+            end_frame = _last_frame(segment_path)
+            break
+        except Exception as exc:
+            last_error = str(exc)
+            task["error"] = last_error
+            if include_source_video and _real_person_privacy_error(exc) and not privacy_fallback_used:
+                privacy_fallback_used = True
+                include_source_video = False
+                task["status"] = "retrying_without_source_video"
+                task["source_video_sent"] = False
+                task["privacy_fallback"] = {
+                    "used": True,
+                    "reason": "real_person_privacy_detected",
+                    "original_error": last_error,
+                    "fallback": "reference_images_and_story_text_only",
+                }
+                task["prompt"] = _build_auto_asset_video_prompt(
+                    job.prompt,
+                    task.get("auto_asset_analysis", {}),
+                    reference_roles=roles,
+                    soft_continuity=bool(task.get("uses_previous_end_frame")),
+                    visual_style=str(options.get("visual_style") or AUTO_ASSET_STYLE_WESTERN),
+                    send_source_video=False,
+                )
                 _atomic_write_json(job.manifest_path, job.manifest)
-                if attempt <= job.max_retries:
-                    time.sleep(min(2.0 * attempt, 8.0))
-                else:
-                    break
-        if task["status"] != "success":
-            job.manifest["status"] = "failed"
-            if state is not None:
-                state["status"] = "failed"
-                state["current_batch"]["status"] = "failed"
-                state["current_batch"]["last_error"] = last_error
-                _manual_batch_write_state(state_path, state)
+                continue
+            if _provider_policy_error(exc):
+                task["status"] = "blocked_by_provider_policy"
+                task["failure_kind"] = "provider_policy"
+                _atomic_write_json(job.manifest_path, job.manifest)
+                break
+            if privacy_fallback_used:
+                task["status"] = "failed"
+                _atomic_write_json(job.manifest_path, job.manifest)
+                break
+            task["status"] = "retrying" if attempt <= job.max_retries else "failed"
             _atomic_write_json(job.manifest_path, job.manifest)
-            raise RuntimeError(
-                f"第 {task['index']} 段生成失败，断点已保存到 {job.manifest_path}\n{last_error}"
-            )
+            if attempt <= job.max_retries:
+                time.sleep(min(2.0 * attempt, 8.0))
+            else:
+                break
+    if task["status"] != "success":
+        job.manifest["status"] = "failed"
+        if state is not None:
+            state["status"] = "failed"
+            state["current_batch"]["status"] = "failed"
+            state["current_batch"]["last_error"] = last_error
+            _manual_batch_write_state(state_path, state)
         _atomic_write_json(job.manifest_path, job.manifest)
-        progress.update(1)
+        raise RuntimeError(
+            f"第 {task['index']} 段生成失败，断点已保存到 {job.manifest_path}\n{last_error}"
+        )
+    _atomic_write_json(job.manifest_path, job.manifest)
+    return end_frame
+
+
+def _finish_segment_generation(job: LongVideoJob, context: dict[str, Any]) -> None:
+    """Mark the batch as generated and hand the manual-batch series over to merging."""
+    state = context["state"]
     job.manifest["status"] = "segments_generated"
     if state is not None:
         state["status"] = "merging"
         state["current_batch"]["status"] = "merging"
-        _manual_batch_write_state(state_path, state)
+        _manual_batch_write_state(context["state_path"], state)
     _atomic_write_json(job.manifest_path, job.manifest)
+
+
+def generate_long_video_segments(job: LongVideoJob) -> LongVideoJob:
+    context = _segment_generation_context(job)
+    previous_end_frame = None
+    progress = ProgressBar(len(job.manifest["tasks"]))
+    for task in job.manifest["tasks"]:
+        previous_end_frame = _generate_single_group_segment(
+            job,
+            task,
+            context,
+            previous_end_frame=previous_end_frame,
+        )
+        progress.update(1)
+    _finish_segment_generation(job, context)
     return job
+
+
+# Keep the consumer responsive once the producer checkpoints a ready group.
+PIPELINE_ASSET_WAIT_POLL_SECONDS = 0.2
+_PIPELINE_ASSET_FAILURE_STATUSES = {
+    "source_frames_failed",
+    "analysis_failed",
+    "failed",
+    "degraded",
+    "identity_review_required",
+}
+
+
+def _pipeline_group_member_ids(task: dict[str, Any]) -> list[int]:
+    """Read the logical member indexes a request group depends on."""
+    values = task.get("logical_segments", [task.get("logical_segment", task.get("index"))])
+    if not isinstance(values, list):
+        values = [values]
+    member_ids = list(dict.fromkeys(int(item) for item in values if item is not None))
+    if not member_ids:
+        raise ValueError(f"第 {task.get('index')} 组没有可等待的逻辑镜头资产。")
+    return member_ids
+
+
+def _wait_pipeline_group_assets(
+    job: LongVideoJob,
+    task: dict[str, Any],
+    *,
+    producer: threading.Thread,
+    producer_error: list[BaseException],
+) -> None:
+    """Block until every member asset of this request group is ready, or fail fast."""
+    member_ids = _pipeline_group_member_ids(task)
+    while True:
+        if producer_error:
+            raise RuntimeError(f"资产生成线程已失败：{producer_error[0]}") from producer_error[0]
+        members_by_index = {
+            int(item["index"]): item
+            for item in _auto_asset_member_tasks(job)
+            if isinstance(item, dict) and item.get("index") is not None
+        }
+        statuses = {
+            index: str((members_by_index.get(index) or {}).get("auto_asset_status") or "planned")
+            for index in member_ids
+        }
+        if all(status == "ready" for status in statuses.values()):
+            return
+        blocked = {index: status for index, status in statuses.items() if status in _PIPELINE_ASSET_FAILURE_STATUSES}
+        if blocked:
+            detail = "，".join(f"镜头 {index} 状态 {status}" for index, status in sorted(blocked.items()))
+            task["reference_package_status"] = "blocked_by_asset_failure"
+            task["status"] = "blocked_by_asset_failure"
+            _atomic_write_json(job.manifest_path, job.manifest)
+            raise RuntimeError(
+                f"第 {task['index']} 组依赖的自动资产不可用（{detail}），断点已保存到 {job.manifest_path}"
+            )
+        if not producer.is_alive():
+            pending = "，".join(f"镜头 {index} 状态 {status}" for index, status in sorted(statuses.items()) if status != "ready")
+            task["reference_package_status"] = "blocked_by_asset_failure"
+            task["status"] = "blocked_by_asset_failure"
+            _atomic_write_json(job.manifest_path, job.manifest)
+            raise RuntimeError(
+                f"资产生成已结束，但第 {task['index']} 组仍缺少素材（{pending}），断点已保存到 {job.manifest_path}"
+            )
+        time.sleep(PIPELINE_ASSET_WAIT_POLL_SECONDS)
+
+
+def generate_long_video_pipeline(job: LongVideoJob, image_concurrency: int = 0) -> tuple[LongVideoJob, str]:
+    """Build shot assets in the background while Seedance generates each ready group in order.
+
+    The producer thread walks the logical shots and checkpoints every finished asset into the
+    manifest. The consumer generates each ready group in order. It only carries the previous end
+    frame across a boundary that splits one logical shot; normal shot and scene changes stay
+    independent.
+    """
+    if job.manifest.get("asset_mode") != "auto_shot_assets":
+        raise ValueError("流水线生成只支持按镜头自动资产任务，请使用原有节点链路。")
+    if int(job.manifest.get("processing_contract_version", 0)) != MANUAL_BATCH_PROCESSING_CONTRACT_VERSION:
+        raise ValueError("流水线生成只支持 contract=4 的手动批次任务。")
+
+    context = _segment_generation_context(job)
+    options = job.manifest.get("auto_asset_options") or {}
+    job.manifest["status"] = "analysis_gateway_preflight"
+    job.manifest["pipeline"] = {
+        "asset_video_overlap": False,
+        "global_integrated_frame_calibration": bool(options.get("use_integrated_frame_references", False)),
+        "image_concurrency": max(0, int(image_concurrency)),
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    _atomic_write_json(job.manifest_path, job.manifest)
+    try:
+        _preflight_auto_asset_analysis_gateway(job)
+    except AnalysisGatewayUnavailableError as exc:
+        _mark_analysis_gateway_unavailable(job, context, exc)
+        raise
+
+    producer_error: list[BaseException] = []
+    producer_cancel = threading.Event()
+    producer_report: dict[str, Any] = {}
+
+    def run_producer() -> None:
+        try:
+            _job, report, _previews = build_long_video_auto_assets(
+                job,
+                int(image_concurrency),
+                cancel_event=producer_cancel,
+                preserve_job_status=True,
+            )
+            producer_report.update(json.loads(report))
+        except BaseException as exc:  # noqa: BLE001 - surfaced to the consumer below
+            producer_error.append(exc)
+            logging.exception("Long video pipeline asset producer failed.")
+
+    job.manifest["status"] = "pipeline_generating"
+    _atomic_write_json(job.manifest_path, job.manifest)
+    pack_context = _v3_group_pack_context(job)
+    tasks = job.manifest["tasks"]
+    progress = ProgressBar(len(tasks))
+    reports: list[dict[str, Any]] = []
+    previous_end_frame = None
+
+    producer = threading.Thread(
+        target=run_producer,
+        name="company-pipeline-assets",
+        daemon=True,
+    )
+    producer.start()
+    try:
+        for task in tasks:
+            _wait_pipeline_group_assets(job, task, producer=producer, producer_error=producer_error)
+            pack_context["members_by_index"] = {
+                int(item["index"]): item
+                for item in _auto_asset_member_tasks(job)
+                if isinstance(item, dict) and item.get("index") is not None
+            }
+            pack_report = _v3_pack_single_group_reference(job, task, pack_context)
+            reports.append(pack_report)
+            _atomic_write_json(job.manifest_path, job.manifest)
+            continuity_frame = previous_end_frame if bool(task.get("continuity_from_previous_group")) else None
+            previous_end_frame = _generate_single_group_segment(
+                job,
+                task,
+                context,
+                previous_end_frame=continuity_frame,
+            )
+            progress.update(1)
+        producer.join()
+        if producer_error:
+            raise RuntimeError(f"资产生成线程已失败：{producer_error[0]}") from producer_error[0]
+        asset_stage_status = str(producer_report.get("asset_stage_status") or "")
+        if asset_stage_status != "auto_assets_ready":
+            raise RuntimeError(f"自动资产阶段没有完整完成，当前状态：{asset_stage_status or 'unknown'}。")
+
+        _finish_segment_generation(job, context)
+        job.manifest["pipeline"]["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        _atomic_write_json(job.manifest_path, job.manifest)
+        summary = {
+            "job_id": job.manifest["job_id"],
+            "mode": "asset_video_pipeline",
+            "status": job.manifest["status"],
+            "image_concurrency": int(image_concurrency),
+            "groups": len(tasks),
+            "reference_packages": reports,
+            "auto_asset_status_counts": _auto_asset_status_counts(job),
+            "asset_stage": producer_report,
+            "manifest": str(job.manifest_path),
+        }
+        return job, json.dumps(summary, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        producer_cancel.set()
+        state = context.get("state")
+        if state is not None:
+            state["status"] = "failed"
+            state["current_batch"]["status"] = "failed"
+            state["current_batch"]["last_error"] = str(exc)
+            _manual_batch_write_state(context["state_path"], state)
+        job.manifest["status"] = "failed"
+        job.manifest.setdefault("pipeline", {})["error"] = str(exc)
+        _atomic_write_json(job.manifest_path, job.manifest)
+        raise
+    finally:
+        producer_cancel.set()
+        producer.join()
 
 
 def collect_long_video_results(job: LongVideoJob) -> tuple[LongVideoJob, str, torch.Tensor]:

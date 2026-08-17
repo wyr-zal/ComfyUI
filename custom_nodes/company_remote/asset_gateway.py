@@ -190,6 +190,134 @@ def _evict_cached_asset(digest: str, asset_id: str) -> None:
             _save_cache(cache)
 
 
+def publish_seedance_person_image(
+    image: Any,
+    *,
+    character_label: str,
+    reuse_cached: bool = True,
+    gateway_config_name: str = ASSET_GATEWAY_CONFIG_NAME,
+    tos_config_name: str = TOS_CONFIG_NAME,
+) -> dict[str, Any]:
+    """Upload a generated person image to TOS and make a best-effort library registration.
+
+    A TOS upload is mandatory because the long-video job needs the object to exist. The
+    optional library registration is intentionally non-fatal: it is useful for future reuse,
+    and active person assets can be submitted to Ark Seedance as ``asset://`` references.
+    """
+    label = str(character_label or "人物").strip()[:40] or "人物"
+    tos_config = get_config(tos_config_name)
+    gateway_config: RemoteMediaConfig | None = None
+    gateway_error = ""
+    try:
+        gateway_config = get_config(gateway_config_name)
+    except Exception as exc:  # The current long-video job only requires TOS.
+        gateway_error = str(exc)
+    content, mime, extension = _image_to_bytes(image, "png")
+    width, height = _image_dimensions(content)
+    if not 300 <= width <= 6000 or not 300 <= height <= 6000:
+        raise CompanyRemoteAPIError(
+            f"{label} 图片尺寸为 {width}x{height}；资产平台要求宽高均在 300 到 6000 像素之间。"
+        )
+
+    digest = hashlib.sha256(content).hexdigest()
+    report: dict[str, Any] = {
+        "character": label,
+        "image": {"width": width, "height": height, "sha256": digest},
+        "tos": {"status": "pending", "object_key": ""},
+        "asset_library": {"status": "pending", "asset_id": "", "cache_reused": False},
+    }
+    cached: dict[str, Any] | None = None
+    if reuse_cached:
+        with _CACHE_LOCK:
+            value = _load_cache()["assets"].get(digest)
+            if isinstance(value, dict) and value.get("asset_type") == "Image":
+                cached = dict(value)
+
+    cached_asset_id = str((cached or {}).get("asset_id") or "").strip()
+    cached_object_key = str((cached or {}).get("tos_object_key") or "").strip()
+    if cached_asset_id:
+        report["tos"] = {"status": "reused", "object_key": cached_object_key}
+        if gateway_config is None:
+            report["asset_library"] = {
+                "status": "warning",
+                "asset_id": "",
+                "cache_reused": True,
+                "error": gateway_error or "素材库配置不可用。",
+            }
+            return report
+        try:
+            _, status_attempts = _wait_for_asset_active(gateway_config, cached_asset_id)
+        except Exception as exc:  # Keep a known TOS object usable for the current job.
+            _evict_cached_asset(digest, cached_asset_id)
+            report["asset_library"] = {
+                "status": "warning",
+                "asset_id": "",
+                "cache_reused": True,
+                "error": str(exc),
+            }
+            return report
+        report["asset_library"] = {
+            "status": "active",
+            "asset_id": cached_asset_id,
+            "cache_reused": True,
+            "registered_at": str((cached or {}).get("registered_at") or ""),
+            "status_poll_attempts": status_attempts,
+        }
+        return report
+
+    # Let TOS errors propagate: without the object, this task must not be sent downstream.
+    signed_url, object_key = _upload_media_to_tos(
+        tos_config,
+        content=content,
+        mime=mime,
+        extension=extension,
+        role=f"asset_image_{digest[:12]}",
+    )
+    report["tos"] = {"status": "uploaded", "object_key": object_key}
+    if gateway_config is None:
+        report["asset_library"] = {
+            "status": "warning",
+            "asset_id": "",
+            "cache_reused": False,
+            "error": gateway_error or "素材库配置不可用。",
+        }
+        return report
+    try:
+        asset_id, _ = _register_asset(gateway_config, image_url=signed_url, asset_type="Image")
+        _, status_attempts = _wait_for_asset_active(gateway_config, asset_id)
+    except Exception as exc:  # The TOS object remains valid even if the library is unavailable.
+        report["asset_library"] = {
+            "status": "warning",
+            "asset_id": "",
+            "cache_reused": False,
+            "error": str(exc),
+        }
+        return report
+
+    registered_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    cache_entry = {
+        "asset_id": asset_id,
+        "asset_type": "Image",
+        "asset_status": "Active",
+        "width": width,
+        "height": height,
+        "registered_at": registered_at,
+        "tos_object_key": object_key,
+    }
+    with _CACHE_LOCK:
+        cache = _load_cache()
+        cache["assets"][digest] = cache_entry
+        _save_cache(cache)
+    report["asset_library"] = {
+        "status": "active",
+        "asset_id": asset_id,
+        "cache_reused": False,
+        "registered_at": registered_at,
+        "status_poll_attempts": status_attempts,
+    }
+    return report
+
+
 def create_seedance_image_asset(
     image: Any,
     *,
