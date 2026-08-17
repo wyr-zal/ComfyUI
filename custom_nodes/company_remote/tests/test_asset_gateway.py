@@ -116,6 +116,80 @@ class AssetGatewayTests(unittest.TestCase):
             self.assertEqual(register.call_count, 1)
             self.assertEqual(wait_for_active.call_count, 2)
 
+    def test_person_publish_reuses_hash_and_never_returns_signed_tos_url(self) -> None:
+        image = torch.from_numpy(np.full((1, 320, 400, 3), 0.75, dtype=np.float32))
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch.object(asset_gateway.folder_paths, "get_user_directory", return_value=directory),
+                mock.patch.object(asset_gateway, "get_config", side_effect=lambda name: _config(name)),
+                mock.patch.object(
+                    asset_gateway,
+                    "_upload_media_to_tos",
+                    return_value=("https://tos.test/person.png?signature=hidden", "assets/person.png"),
+                ) as upload,
+                mock.patch.object(
+                    asset_gateway,
+                    "_register_asset",
+                    return_value=("asset-person-123", {"asset_id": "asset-person-123"}),
+                ) as register,
+                mock.patch.object(
+                    asset_gateway,
+                    "_wait_for_asset_active",
+                    return_value=({"Status": "Active"}, 1),
+                ) as wait_for_active,
+            ):
+                first = asset_gateway.publish_seedance_person_image(image, character_label="第 1 段人物 A")
+                second = asset_gateway.publish_seedance_person_image(image, character_label="第 2 段人物 A")
+
+            self.assertEqual(first["tos"], {"status": "uploaded", "object_key": "assets/person.png"})
+            self.assertEqual(first["asset_library"]["asset_id"], "asset-person-123")
+            self.assertEqual(second["tos"]["status"], "reused")
+            self.assertTrue(second["asset_library"]["cache_reused"])
+            self.assertNotIn("signature=hidden", json.dumps(first, ensure_ascii=False))
+            self.assertEqual(upload.call_count, 1)
+            self.assertEqual(register.call_count, 1)
+            self.assertEqual(wait_for_active.call_count, 2)
+
+    def test_person_publish_keeps_tos_result_when_asset_library_is_unavailable(self) -> None:
+        image = torch.from_numpy(np.full((1, 320, 400, 3), 0.6, dtype=np.float32))
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch.object(asset_gateway.folder_paths, "get_user_directory", return_value=directory),
+                mock.patch.object(asset_gateway, "get_config", side_effect=lambda name: _config(name)),
+                mock.patch.object(
+                    asset_gateway,
+                    "_upload_media_to_tos",
+                    return_value=("https://tos.test/person.png?signature=hidden", "assets/person.png"),
+                ) as upload,
+                mock.patch.object(
+                    asset_gateway,
+                    "_register_asset",
+                    side_effect=asset_gateway.CompanyRemoteAPIError("素材库暂时不可用"),
+                ),
+            ):
+                report = asset_gateway.publish_seedance_person_image(image, character_label="第 1 段人物 B")
+
+            upload.assert_called_once()
+            self.assertEqual(report["tos"]["status"], "uploaded")
+            self.assertEqual(report["asset_library"]["status"], "warning")
+            self.assertIn("素材库暂时不可用", report["asset_library"]["error"])
+
+    def test_person_publish_propagates_tos_failure(self) -> None:
+        image = torch.from_numpy(np.full((1, 320, 400, 3), 0.4, dtype=np.float32))
+        with (
+            mock.patch.object(asset_gateway, "get_config", side_effect=lambda name: _config(name)),
+            mock.patch.object(
+                asset_gateway,
+                "_upload_media_to_tos",
+                side_effect=asset_gateway.CompanyRemoteAPIError("TOS 写入失败"),
+            ),
+            mock.patch.object(asset_gateway, "_register_asset") as register,
+        ):
+            with self.assertRaisesRegex(asset_gateway.CompanyRemoteAPIError, "TOS 写入失败"):
+                asset_gateway.publish_seedance_person_image(image, character_label="第 1 段人物 C")
+
+        register.assert_not_called()
+
     def test_rejects_too_small_image_before_upload(self) -> None:
         image = torch.zeros((1, 299, 400, 3), dtype=torch.float32)
         with mock.patch.object(asset_gateway, "get_config", side_effect=lambda name: _config(name)):

@@ -95,6 +95,34 @@ class Wan27ThreeImageDirectTests(unittest.TestCase):
         self.assertEqual(kwargs["audio_setting"], "origin")
         self.assertTrue(config.tos_enabled)
 
+    def test_wan30_video_edit_node_uses_wan3_model_and_keeps_original_audio(self) -> None:
+        config = SimpleNamespace(
+            tos_enabled=True,
+            media_delivery="tos_presigned",
+            extra_headers={"X-DashScope-Async": "enable"},
+        )
+        with (
+            mock.patch.object(nodes, "_load_provider_config", return_value=config) as load_config,
+            mock.patch.object(nodes, "generate_dashscope_video", return_value=(object(), "/tmp/wan30.mp4")) as generate,
+        ):
+            result = nodes.CompanyWan30ThreePersonVideoEdit.execute(
+                object(), object(), object(), object(), "replace A/B/C", "wan3.0-video", "720P", 8
+            )
+
+        self.assertEqual(result[1], "/tmp/wan30.mp4")
+        load_config.assert_called_once_with("aliyun_dashscope_video_direct")
+        submitted_config = generate.call_args.args[0]
+        kwargs = generate.call_args.kwargs
+        self.assertFalse(submitted_config.tos_enabled)
+        self.assertEqual(submitted_config.media_delivery, "base64")
+        self.assertNotIn("X-DashScope-Async", submitted_config.extra_headers)
+        self.assertEqual(submitted_config.extra_headers["X-DashScope-OssResourceResolve"], "enable")
+        self.assertEqual(kwargs["operation"], "dashscope_video_edit")
+        self.assertEqual(kwargs["model"], "wan3.0-video")
+        self.assertEqual(kwargs["duration"], 8)
+        self.assertEqual(kwargs["audio_setting"], "origin")
+        self.assertEqual(len(kwargs["reference_images"]), 3)
+
     def test_dashscope_temp_oss_upload_uses_model_bound_policy(self) -> None:
         config = RemoteMediaConfig(
             name="aliyun_dashscope_video_direct",
@@ -145,6 +173,24 @@ class Wan27ThreeImageDirectTests(unittest.TestCase):
         self.assertEqual(direct["widgets_values"][1], "wan2.7-videoedit")
         self.assertEqual(direct["widgets_values"][2:5], ["720P", 0, "origin"])
         self.assertEqual(len([node for node in workflow["nodes"] if node["type"] == "LoadImage"]), 3)
+
+    def test_wan27_copy_full_workflow_preserves_three_way_topology(self) -> None:
+        path = (
+            Path(__file__).resolve().parents[3]
+            / "user"
+            / "default"
+            / "workflows"
+            / "Wan3.0_三人物参考图直传_无TOS无火山_20秒完整处理.json"
+        )
+        workflow = json.loads(path.read_text(encoding="utf-8"))
+        processors = [node for node in workflow["nodes"] if node["type"] == "CompanyWan27ThreePersonVideoEdit"]
+        self.assertEqual(len(workflow["nodes"]), 13)
+        self.assertEqual(len(workflow["links"]), 21)
+        self.assertEqual(len(processors), 3)
+        self.assertEqual([node["widgets_values"][1] for node in processors], ["wan2.7-videoedit"] * 3)
+        self.assertEqual([node["widgets_values"][3] for node in processors], [0, 0, 0])
+        self.assertEqual([node["widgets_values"][4] for node in processors], ["origin"] * 3)
+        self.assertEqual([node["widgets_values"][5] for node in processors], [True] * 3)
 
     def test_full_video_segments_cover_all_484_frames_within_wan_limit(self) -> None:
         fps = 11616 / 493
