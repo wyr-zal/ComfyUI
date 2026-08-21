@@ -1,0 +1,1565 @@
+{
+  "id": "3b28c0ba-40fd-588a-8ed4-006fb920294c",
+  "revision": 0,
+  "last_node_id": 17,
+  "last_link_id": 12,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadVideo",
+      "pos": [
+        0,
+        260
+      ],
+      "size": [
+        420.40625,
+        347.296875
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "文件",
+          "name": "file",
+          "type": "COMBO",
+          "widget": {
+            "name": "file"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "选择要上传的文件",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "视频",
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            1
+          ]
+        }
+      ],
+      "title": "1. 输入长视频",
+      "properties": {
+        "Node name for S&R": "LoadVideo"
+      },
+      "widgets_values": [
+        "douyin.wtf_douyin_7659377062033050918.mp4",
+        "image"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "CompanyLongVideoShotDetector",
+      "pos": [
+        480,
+        210
+      ],
+      "size": [
+        540,
+        430
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "video",
+          "name": "video",
+          "type": "VIDEO",
+          "link": 1
+        },
+        {
+          "localized_name": "mode",
+          "name": "mode",
+          "type": "COMBO",
+          "widget": {
+            "name": "mode"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "fixed_duration",
+          "name": "fixed_duration",
+          "type": "COMBO",
+          "widget": {
+            "name": "fixed_duration"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "sensitivity",
+          "name": "sensitivity",
+          "type": "COMBO",
+          "widget": {
+            "name": "sensitivity"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "use_audio_silence",
+          "name": "use_audio_silence",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "use_audio_silence"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "auto_fallback",
+          "name": "auto_fallback",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "auto_fallback"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "镜头计划",
+          "name": "镜头计划",
+          "type": "长视频镜头计划",
+          "links": [
+            2
+          ]
+        },
+        {
+          "localized_name": "镜头检测 JSON",
+          "name": "镜头检测 JSON",
+          "type": "STRING",
+          "links": []
+        },
+        {
+          "localized_name": "镜头起始帧预览",
+          "name": "镜头起始帧预览",
+          "type": "IMAGE",
+          "links": []
+        }
+      ],
+      "title": "2. 检测镜头与转场",
+      "properties": {
+        "Node name for S&R": "CompanyLongVideoShotDetector"
+      },
+      "widgets_values": [
+        "镜头优先（推荐）",
+        "10",
+        "标准",
+        true,
+        true
+      ],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 3,
+      "type": "CompanyLongVideoLengthRangeSelector",
+      "pos": [
+        1140,
+        220
+      ],
+      "size": [
+        580,
+        470
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "shot_plan",
+          "localized_name": "镜头计划",
+          "type": "长视频镜头计划",
+          "link": 2
+        },
+        {
+          "name": "start_shot",
+          "localized_name": "起始镜头序号",
+          "type": "INT",
+          "link": null,
+          "widget": {
+            "name": "start_shot"
+          }
+        },
+        {
+          "name": "limit_mode",
+          "localized_name": "生成范围控制方式",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "limit_mode"
+          }
+        },
+        {
+          "name": "limit_minutes",
+          "localized_name": "生成时长（分钟，0=全部剩余）",
+          "type": "FLOAT",
+          "link": null,
+          "widget": {
+            "name": "limit_minutes"
+          }
+        },
+        {
+          "name": "limit_percent",
+          "localized_name": "占原视频总长百分比（0=全部剩余）",
+          "type": "FLOAT",
+          "link": null,
+          "widget": {
+            "name": "limit_percent"
+          }
+        },
+        {
+          "name": "shot_count",
+          "localized_name": "镜头数量（0=全部剩余）",
+          "type": "INT",
+          "link": null,
+          "widget": {
+            "name": "shot_count"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "选中范围镜头计划",
+          "name": "选中范围镜头计划",
+          "type": "长视频镜头计划",
+          "links": [
+            3
+          ]
+        },
+        {
+          "localized_name": "选中范围原视频",
+          "name": "选中范围原视频",
+          "type": "VIDEO",
+          "links": []
+        },
+        {
+          "localized_name": "范围选择报告 JSON",
+          "name": "范围选择报告 JSON",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "title": "3. 按时长/百分比选择生成范围",
+      "properties": {
+        "Node name for S&R": "CompanyLongVideoLengthRangeSelector"
+      },
+      "widgets_values": [
+        1,
+        "按分钟",
+        2.0,
+        30.0,
+        0
+      ],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 4,
+      "type": "CompanyLongVideoAnimeAssetPlannerV3",
+      "pos": [
+        1780,
+        -80
+      ],
+      "size": [
+        600,
+        760
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "shot_plan",
+          "name": "shot_plan",
+          "type": "长视频镜头计划",
+          "link": 3
+        },
+        {
+          "localized_name": "prompt",
+          "name": "prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "prompt"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "model",
+          "name": "model",
+          "type": "COMBO",
+          "widget": {
+            "name": "model"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "analysis_model",
+          "name": "analysis_model",
+          "type": "COMBO",
+          "widget": {
+            "name": "analysis_model"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "image_model",
+          "name": "image_model",
+          "type": "COMBO",
+          "widget": {
+            "name": "image_model"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "image_quality",
+          "name": "image_quality",
+          "type": "COMBO",
+          "widget": {
+            "name": "image_quality"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "reuse_threshold",
+          "name": "reuse_threshold",
+          "type": "FLOAT",
+          "widget": {
+            "name": "reuse_threshold"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "max_retries",
+          "name": "max_retries",
+          "type": "INT",
+          "widget": {
+            "name": "max_retries"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "resume",
+          "name": "resume",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "resume"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "force_rerun",
+          "name": "force_rerun",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "force_rerun"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "force_rerun_assets",
+          "name": "force_rerun_assets",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "force_rerun_assets"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "image_provider",
+          "name": "image_provider",
+          "type": "COMBO",
+          "widget": {
+            "name": "image_provider"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "negative_prompt",
+          "name": "negative_prompt",
+          "shape": 7,
+          "type": "STRING",
+          "widget": {
+            "name": "negative_prompt"
+          },
+          "link": null
+        },
+        {
+          "name": "target_resource_type",
+          "localized_name": "目标资源类型",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "target_resource_type"
+          }
+        },
+        {
+          "name": "use_original_audio",
+          "localized_name": "使用原视频音频",
+          "type": "BOOLEAN",
+          "link": null,
+          "widget": {
+            "name": "use_original_audio"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "全动漫长视频任务",
+          "name": "全动漫长视频任务",
+          "type": "长视频分段任务",
+          "links": [
+            4
+          ]
+        },
+        {
+          "localized_name": "任务计划 JSON",
+          "name": "任务计划 JSON",
+          "type": "STRING",
+          "links": []
+        },
+        {
+          "localized_name": "任务 manifest 路径",
+          "name": "任务 manifest 路径",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "title": "3. 建立 v3 多风格资产任务（短镜头合并 / 音频可选）",
+      "properties": {
+        "Node name for S&R": "CompanyLongVideoAnimeAssetPlannerV3"
+      },
+      "widgets_values": [
+        "把本段重新演绎为统一的高质量二维动漫视频。参考图片是人物身份、服装、道具和环境美术的唯一视觉依据；严格保持实际人物数量、人物关系、主要剧情顺序和场景功能。根据镜头分析文字自然设计动作、表情、走位和镜头运动。从第一帧到最后一帧，人物与完整背景都必须保持清晰线稿、赛璐璐分层上色和统一动漫光影；不得出现真人脸、真实皮肤、照片纹理、真人摄影画面、半真人半动漫、写实 3D 人物、风格闪回、字幕、Logo 或水印。",
+        "Seedance 2.0 Fast",
+        "gpt-5.6-terra",
+        "gpt-image-2",
+        "low",
+        0.85,
+        2,
+        true,
+        false,
+        false,
+        "AI-Zero-Token",
+        "真人，真实人脸，真实皮肤，照片，摄影，写实，半真人，真人背景，皮肤毛孔，镜头噪点，写实3D，风格漂移，真人闪回，多余人物，人物复制，肢体畸形，字幕，文字，Logo，水印",
+        "二维动漫资源",
+        false
+      ],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 5,
+      "type": "CompanyLongVideoAutoAssetBuilder",
+      "pos": [
+        2480,
+        0
+      ],
+      "size": [
+        480,
+        320
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "job",
+          "name": "job",
+          "type": "长视频分段任务",
+          "link": 4
+        },
+        {
+          "localized_name": "image_concurrency",
+          "name": "image_concurrency",
+          "type": "INT",
+          "widget": {
+            "name": "image_concurrency"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "已生成镜头资产的任务",
+          "name": "已生成镜头资产的任务",
+          "type": "长视频分段任务",
+          "links": [
+            6
+          ]
+        },
+        {
+          "localized_name": "镜头资产报告 JSON",
+          "name": "镜头资产报告 JSON",
+          "type": "STRING",
+          "links": []
+        },
+        {
+          "localized_name": "源帧与自动资产预览",
+          "name": "源帧与自动资产预览",
+          "type": "IMAGE",
+          "links": [
+            5
+          ]
+        }
+      ],
+      "title": "4. 完整画面转绘并自动淘汰弱转换",
+      "properties": {
+        "Node name for S&R": "CompanyLongVideoAutoAssetBuilder"
+      },
+      "widgets_values": [
+        5,
+        ""
+      ],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 6,
+      "type": "CompanyFixedColumnImagePreview",
+      "pos": [
+        3060,
+        0
+      ],
+      "size": [
+        760,
+        2815.375
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "images",
+          "name": "images",
+          "type": "IMAGE",
+          "link": 5
+        },
+        {
+          "localized_name": "columns",
+          "name": "columns",
+          "type": "COMBO",
+          "widget": {
+            "name": "columns"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "gap",
+          "name": "gap",
+          "type": "INT",
+          "widget": {
+            "name": "gap"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "原始图片",
+          "name": "原始图片",
+          "type": "IMAGE",
+          "links": []
+        }
+      ],
+      "title": "检查：原始首中尾帧与转换后的目标人物/场景",
+      "properties": {
+        "Node name for S&R": "CompanyFixedColumnImagePreview",
+        "last_fixed_grid_images": [
+          {
+            "filename": "ComfyUI_temp_jtynp_00001_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00002_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00003_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00004_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00005_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00006_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00007_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00008_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00009_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00010_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00011_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00012_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00013_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00014_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00015_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00016_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00017_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00018_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00019_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00020_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00021_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00022_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00023_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00024_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00025_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00026_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00027_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00028_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00029_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00030_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00031_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_jtynp_00032_.png",
+            "subfolder": "",
+            "type": "temp"
+          }
+        ]
+      },
+      "widgets_values": [
+        "3",
+        8,
+        ""
+      ],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 7,
+      "type": "CompanyLongVideoAutoReferencePacker",
+      "pos": [
+        3960,
+        0
+      ],
+      "size": [
+        460,
+        300
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "job",
+          "name": "job",
+          "type": "长视频分段任务",
+          "link": 6
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "已打包参考素材的任务",
+          "name": "已打包参考素材的任务",
+          "type": "长视频分段任务",
+          "links": [
+            8
+          ]
+        },
+        {
+          "localized_name": "参考素材报告 JSON",
+          "name": "参考素材报告 JSON",
+          "type": "STRING",
+          "links": []
+        },
+        {
+          "localized_name": "自动参考包预览",
+          "name": "自动参考包预览",
+          "type": "IMAGE",
+          "links": [
+            7
+          ]
+        }
+      ],
+      "title": "5. 只打包合格整帧并标注对应时间",
+      "properties": {
+        "Node name for S&R": "CompanyLongVideoAutoReferencePacker"
+      },
+      "widgets_values": [],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 8,
+      "type": "CompanyFixedColumnImagePreview",
+      "pos": [
+        4540,
+        0
+      ],
+      "size": [
+        720,
+        1751.34375
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "images",
+          "name": "images",
+          "type": "IMAGE",
+          "link": 7
+        },
+        {
+          "localized_name": "columns",
+          "name": "columns",
+          "type": "COMBO",
+          "widget": {
+            "name": "columns"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "gap",
+          "name": "gap",
+          "type": "INT",
+          "widget": {
+            "name": "gap"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "原始图片",
+          "name": "原始图片",
+          "type": "IMAGE",
+          "links": []
+        }
+      ],
+      "title": "检查：将交给 Seedance 的目标人物/场景参考图",
+      "properties": {
+        "Node name for S&R": "CompanyFixedColumnImagePreview",
+        "last_fixed_grid_images": [
+          {
+            "filename": "ComfyUI_temp_qhvvo_00001_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_qhvvo_00002_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_qhvvo_00003_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_qhvvo_00004_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_qhvvo_00005_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_qhvvo_00006_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_qhvvo_00007_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_qhvvo_00008_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_qhvvo_00009_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_qhvvo_00010_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_qhvvo_00011_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_qhvvo_00012_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_qhvvo_00013_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_qhvvo_00014_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_qhvvo_00015_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_qhvvo_00016_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_qhvvo_00017_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_qhvvo_00018_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_qhvvo_00019_.png",
+            "subfolder": "",
+            "type": "temp"
+          }
+        ]
+      },
+      "widgets_values": [
+        "3",
+        8,
+        ""
+      ],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 9,
+      "type": "CompanyLongVideoSegmentGenerator",
+      "pos": [
+        5460,
+        0
+      ],
+      "size": [
+        480,
+        300
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "job",
+          "name": "job",
+          "type": "长视频分段任务",
+          "link": 8
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "已生成任务",
+          "name": "已生成任务",
+          "type": "长视频分段任务",
+          "links": [
+            9
+          ]
+        },
+        {
+          "localized_name": "生成状态 JSON",
+          "name": "生成状态 JSON",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "title": "6. Seedance 顺序生成完整请求组（默认同时生成音频）",
+      "properties": {
+        "Node name for S&R": "CompanyLongVideoSegmentGenerator"
+      },
+      "widgets_values": [],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 10,
+      "type": "CompanyLongVideoContinuityPreview",
+      "pos": [
+        6080,
+        0
+      ],
+      "size": [
+        510,
+        1030.65625
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "job",
+          "name": "job",
+          "type": "长视频分段任务",
+          "link": 9
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "可合并任务",
+          "name": "可合并任务",
+          "type": "长视频分段任务",
+          "links": [
+            11
+          ]
+        },
+        {
+          "localized_name": "连续性检查 JSON",
+          "name": "连续性检查 JSON",
+          "type": "STRING",
+          "links": []
+        },
+        {
+          "localized_name": "各段末帧",
+          "name": "各段末帧",
+          "type": "IMAGE",
+          "links": [
+            10
+          ]
+        }
+      ],
+      "title": "7. 逐组播放检查完整画面与连续性",
+      "properties": {
+        "Node name for S&R": "CompanyLongVideoContinuityPreview"
+      },
+      "widgets_values": [],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 11,
+      "type": "CompanyFixedColumnImagePreview",
+      "pos": [
+        5374.741168533062,
+        511.99399038212937
+      ],
+      "size": [
+        650,
+        558
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "images",
+          "name": "images",
+          "type": "IMAGE",
+          "link": 10
+        },
+        {
+          "localized_name": "columns",
+          "name": "columns",
+          "type": "COMBO",
+          "widget": {
+            "name": "columns"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "gap",
+          "name": "gap",
+          "type": "INT",
+          "widget": {
+            "name": "gap"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "原始图片",
+          "name": "原始图片",
+          "type": "IMAGE",
+          "links": []
+        }
+      ],
+      "title": "预览：每段生成视频的末帧",
+      "properties": {
+        "Node name for S&R": "CompanyFixedColumnImagePreview",
+        "last_fixed_grid_images": [
+          {
+            "filename": "ComfyUI_temp_dqzbg_00001_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_dqzbg_00002_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_dqzbg_00003_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_dqzbg_00004_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_dqzbg_00005_.png",
+            "subfolder": "",
+            "type": "temp"
+          },
+          {
+            "filename": "ComfyUI_temp_dqzbg_00006_.png",
+            "subfolder": "",
+            "type": "temp"
+          }
+        ]
+      },
+      "widgets_values": [
+        "3",
+        8,
+        ""
+      ],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 12,
+      "type": "CompanyLongVideoFinalMerger",
+      "pos": [
+        6780,
+        0
+      ],
+      "size": [
+        510,
+        350
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "job",
+          "name": "job",
+          "type": "长视频分段任务",
+          "link": 11
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "最终视频",
+          "name": "最终视频",
+          "type": "VIDEO",
+          "links": [
+            12
+          ]
+        },
+        {
+          "localized_name": "最终视频路径",
+          "name": "最终视频路径",
+          "type": "STRING",
+          "links": []
+        },
+        {
+          "localized_name": "任务 manifest 路径",
+          "name": "任务 manifest 路径",
+          "type": "STRING",
+          "links": []
+        },
+        {
+          "localized_name": "任务状态 JSON",
+          "name": "任务状态 JSON",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "title": "8. 合并完整请求组并按开关处理音频",
+      "properties": {
+        "Node name for S&R": "CompanyLongVideoFinalMerger"
+      },
+      "widgets_values": [],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 13,
+      "type": "SaveVideo",
+      "pos": [
+        7460,
+        0
+      ],
+      "size": [
+        288.0625,
+        664.125
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "视频",
+          "name": "video",
+          "type": "VIDEO",
+          "link": 12
+        },
+        {
+          "localized_name": "文件名前缀",
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "格式",
+          "name": "format",
+          "type": "COMBO",
+          "widget": {
+            "name": "format"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "编码器",
+          "name": "codec",
+          "type": "COMBO",
+          "widget": {
+            "name": "codec"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "video",
+          "name": "video",
+          "type": "VIDEO",
+          "links": null
+        }
+      ],
+      "title": "保存 v3 多风格人物视频结果（Seedance）",
+      "properties": {},
+      "widgets_values": [
+        "video/LongVideoAnimeAutoShotAssets_Seedance",
+        "auto",
+        "auto"
+      ]
+    },
+    {
+      "id": 14,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -1200
+      ],
+      "size": [
+        1450,
+        820
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "工作流总览｜自动范围 v3：短镜头合并、素材复用、音频可选",
+      "properties": {},
+      "widgets_values": [
+        "# 工作流用途\n\n按镜头自动完成资产分析、目标风格整帧转绘、参考打包、Seedance 生成与最终合并。与手动批次版不同，本流程不会在每个批次后暂停，适合配置和素材已经通过小样验证后运行。\n\n## 整体思路\n\n`检测镜头 → 限制范围 → 逐镜头建立资产任务 → 合并相邻短镜头为合法请求组 → 生成并筛选整帧 → 打包参考 → Seedance 顺序生成 → 检查 → 合并与保存`\n\n首次使用仍建议把节点 3 限制在短范围，确认成本和效果后再扩大。"
+      ],
+      "color": "#30485f",
+      "bgcolor": "#3f607d"
+    },
+    {
+      "id": 15,
+      "type": "MarkdownNote",
+      "pos": [
+        1550,
+        -1200
+      ],
+      "size": [
+        1500,
+        820
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "节点作用｜范围与 v3 任务规划",
+      "properties": {},
+      "widgets_values": [
+        "# 节点 1–4\n\n1. **输入长视频**：选择源视频。\n2. **检测镜头与转场**：本地识别逻辑镜头。\n3. **按时长/百分比选择范围**：可按分钟、百分比或镜头数限制本次处理范围；当前保存值为按分钟 2 分钟。\n4. **建立 v3 多风格资产任务**：选择目标资源类型、分析/图片/视频模型、重试与断点恢复，并把不足 4 秒的相邻短镜头确定性合并为 4–15 秒请求组。\n\n规划阶段会把提示词、资源类型、音频开关和范围写入 manifest。改变这些关键参数会形成新的任务签名，避免错误复用旧结果。"
+      ],
+      "color": "#4b416d",
+      "bgcolor": "#62568b"
+    },
+    {
+      "id": 16,
+      "type": "MarkdownNote",
+      "pos": [
+        3150,
+        -1200
+      ],
+      "size": [
+        1600,
+        820
+      ],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "节点作用｜自动资产、质量门控与参考包",
+      "properties": {},
+      "widgets_values": [
+        "# 节点 5–8\n\n5. **完整画面转绘**：按逻辑镜头分析并生成/复用人物、场景与整帧参考，自动淘汰风格太弱、原风格残留、身份/人数或构图不合格的结果；会调用远端文本和图片服务。\n6. **资产对照预览**：比较原始首中尾帧与目标风格结果。\n7. **参考打包**：只接受 `ready` 整帧，按实际图片顺序写入时间范围；不把失败或待人工确认素材静默交给视频模型。\n8. **参考包预览**：确认真正发送给 Seedance 的图片内容和顺序。\n\n素材库和 manifest 支持断点恢复；`force_rerun`/`force_rerun_assets` 仅在明确需要废弃缓存时开启。"
+      ],
+      "color": "#4b416d",
+      "bgcolor": "#62568b"
+    },
+    {
+      "id": 17,
+      "type": "MarkdownNote",
+      "pos": [
+        4850,
+        -1200
+      ],
+      "size": [
+        1850,
+        820
+      ],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "节点作用｜Seedance、音频、检查与合并",
+      "properties": {},
+      "widgets_values": [
+        "# 节点 9–13\n\n9. **Seedance 顺序生成请求组**：主要付费视频阶段。当前 `use_original_audio=false`，默认让 Seedance 同时生成音频；若节点 4 改为 true，则关闭生成音频并在节点 12 恢复原音轨。\n10. **逐组连续性检查**：播放结果并输出每组末帧。\n11. **末帧网格**：人工核对身份、场景、风格和动作方向。\n12. **最终合并**：按请求组拼接，并依据音频开关保留生成音频或恢复原音频。远端结果不裁剪；短于请求时仅补尾帧。\n13. **保存结果**：输出最终视频。\n\n此流程不设置“每批暂停”门槛；若需要逐批人工放行，应改用手动批次工作流。"
+      ],
+      "color": "#6b4f31",
+      "bgcolor": "#876640"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "VIDEO"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      0,
+      "长视频镜头计划"
+    ],
+    [
+      3,
+      3,
+      0,
+      4,
+      0,
+      "长视频镜头计划"
+    ],
+    [
+      4,
+      4,
+      0,
+      5,
+      0,
+      "长视频分段任务"
+    ],
+    [
+      5,
+      5,
+      2,
+      6,
+      0,
+      "IMAGE"
+    ],
+    [
+      6,
+      5,
+      0,
+      7,
+      0,
+      "长视频分段任务"
+    ],
+    [
+      7,
+      7,
+      2,
+      8,
+      0,
+      "IMAGE"
+    ],
+    [
+      8,
+      7,
+      0,
+      9,
+      0,
+      "长视频分段任务"
+    ],
+    [
+      9,
+      9,
+      0,
+      10,
+      0,
+      "长视频分段任务"
+    ],
+    [
+      10,
+      10,
+      2,
+      11,
+      0,
+      "IMAGE"
+    ],
+    [
+      11,
+      10,
+      0,
+      12,
+      0,
+      "长视频分段任务"
+    ],
+    [
+      12,
+      12,
+      0,
+      13,
+      0,
+      "VIDEO"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "A. 检测并限制生成范围",
+      "bounding": [
+        -60,
+        140,
+        1800,
+        760
+      ],
+      "color": "#3f789e",
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "B. 自动生成并检查目标人物/背景资产",
+      "bounding": [
+        1720,
+        -140,
+        2140,
+        780
+      ],
+      "color": "#81683e",
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "C. 打包并检查 Seedance 目标参考图",
+      "bounding": [
+        3900,
+        -100,
+        1440,
+        700
+      ],
+      "color": "#4f7f69",
+      "flags": {}
+    },
+    {
+      "id": 4,
+      "title": "D. 顺序生成、检查、合并与保存",
+      "bounding": [
+        5400,
+        -100,
+        2600,
+        1100
+      ],
+      "color": "#6b5b95",
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "workflow_note": "v3 独立工作流：逐个原逻辑镜头分析并生成资产；不足 4 秒的相邻镜头确定性合并后发送给 Seedance，同组镜头只发送通过质量筛选的完整转绘画面，并按图片序号标注对应时间范围。默认由 Seedance 同时生成音频；开启使用原视频音频后关闭生成音频，并按请求组恢复原音轨。远端生成视频不裁剪，短于请求时仅补最后一帧。",
+    "long_video": {
+      "auto_shot_assets": true,
+      "remote_video_requests": true,
+      "manifest_version": 4,
+      "video_engine": "seedance",
+      "video_model": "Seedance 2.0 Fast",
+      "visual_style": "anime_2d",
+      "send_source_video": false,
+      "range_limit": {
+        "enabled": true,
+        "default_mode": "按分钟",
+        "default_minutes": 2.0,
+        "whole_shot_policy": true
+      },
+      "selectable_visual_styles": [
+        "western",
+        "photoreal",
+        "anime_2d",
+        "cg_3d",
+        "comic_illustration",
+        "custom"
+      ],
+      "processing_contract_version": 3,
+      "short_shot_grouping": "adjacent-short-shots-v1",
+      "reference_package_version": "integrated-frames-v2",
+      "use_original_audio_default": false,
+      "preserve_generated_video_content": true
+    },
+    "ds": {
+      "scale": 0.29705992025032407,
+      "offset": [
+        1151.3413083367434,
+        798.6592466014231
+      ]
+    },
+    "company_remote_handover_notes": {
+      "version": 1,
+      "language": "zh-CN",
+      "node_type": "MarkdownNote",
+      "execution_impact": false
+    }
+  },
+  "version": 0.4
+}

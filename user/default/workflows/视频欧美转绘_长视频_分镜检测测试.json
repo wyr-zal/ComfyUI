@@ -1,0 +1,670 @@
+{
+  "id": "98f457f2-8947-561b-9430-6e612f190478",
+  "revision": 0,
+  "last_node_id": 11,
+  "last_link_id": 7,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadVideo",
+      "pos": [
+        0,
+        160
+      ],
+      "size": [
+        420.40625,
+        347.296875
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "文件",
+          "name": "file",
+          "type": "COMBO",
+          "widget": {
+            "name": "file"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "选择要上传的文件",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "视频",
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            1
+          ]
+        }
+      ],
+      "title": "1. 输入待检测的长视频",
+      "properties": {
+        "Node name for S&R": "LoadVideo"
+      },
+      "widgets_values": [
+        "",
+        "image"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "CompanyLongVideoShotDetector",
+      "pos": [
+        520,
+        100
+      ],
+      "size": [
+        560,
+        430
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "localized_name": "长视频",
+          "type": "VIDEO",
+          "link": 1
+        },
+        {
+          "name": "mode",
+          "localized_name": "切分模式",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "mode"
+          }
+        },
+        {
+          "name": "fixed_duration",
+          "localized_name": "固定分段时长（秒）",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "fixed_duration"
+          }
+        },
+        {
+          "name": "sensitivity",
+          "localized_name": "镜头检测灵敏度",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "sensitivity"
+          }
+        },
+        {
+          "name": "use_audio_silence",
+          "localized_name": "用音频停顿辅助长镜头切分",
+          "type": "BOOLEAN",
+          "link": null,
+          "widget": {
+            "name": "use_audio_silence"
+          }
+        },
+        {
+          "name": "auto_fallback",
+          "localized_name": "检测失败自动改用固定切分",
+          "type": "BOOLEAN",
+          "link": null,
+          "widget": {
+            "name": "auto_fallback"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "镜头计划",
+          "localized_name": "镜头计划",
+          "type": "长视频镜头计划",
+          "links": [
+            2
+          ]
+        },
+        {
+          "name": "镜头检测 JSON",
+          "localized_name": "镜头检测 JSON",
+          "type": "STRING",
+          "links": [
+            6
+          ]
+        },
+        {
+          "name": "镜头起始帧预览",
+          "localized_name": "镜头起始帧预览",
+          "type": "IMAGE",
+          "links": [
+            3
+          ]
+        }
+      ],
+      "title": "2. 检测硬切、淡入淡出和逻辑镜头",
+      "properties": {
+        "Node name for S&R": "CompanyLongVideoShotDetector"
+      },
+      "widgets_values": [
+        "镜头优先（推荐）",
+        "10",
+        "标准",
+        true,
+        true
+      ],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 3,
+      "type": "CompanyLongVideoShotInspector",
+      "pos": [
+        1220,
+        80
+      ],
+      "size": [
+        600,
+        390
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "shot_plan",
+          "localized_name": "镜头计划",
+          "type": "长视频镜头计划",
+          "link": 2
+        },
+        {
+          "name": "shot_index",
+          "localized_name": "要检查的镜头序号",
+          "type": "INT",
+          "link": null,
+          "widget": {
+            "name": "shot_index"
+          }
+        },
+        {
+          "name": "export_all_shots",
+          "localized_name": "导出全部检测镜头",
+          "type": "BOOLEAN",
+          "link": null,
+          "widget": {
+            "name": "export_all_shots"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "选中镜头视频",
+          "localized_name": "选中镜头视频",
+          "type": "VIDEO",
+          "links": []
+        },
+        {
+          "name": "选中镜头首中尾帧",
+          "localized_name": "选中镜头首中尾帧",
+          "type": "IMAGE",
+          "links": [
+            4
+          ]
+        },
+        {
+          "name": "切点前后帧对比",
+          "localized_name": "切点前后帧对比",
+          "type": "IMAGE",
+          "links": [
+            5
+          ]
+        },
+        {
+          "name": "分镜检查报告 JSON",
+          "localized_name": "分镜检查报告 JSON",
+          "type": "STRING",
+          "links": [
+            7
+          ]
+        },
+        {
+          "name": "全部镜头导出目录",
+          "localized_name": "全部镜头导出目录",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "title": "3. 选择镜头并播放检查（本地，不调用远端）",
+      "properties": {
+        "Node name for S&R": "CompanyLongVideoShotInspector"
+      },
+      "widgets_values": [
+        1,
+        false
+      ],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 4,
+      "type": "PreviewImage",
+      "pos": [
+        520,
+        620
+      ],
+      "size": [
+        325.390625,
+        363.96875
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "localized_name": "图像",
+          "type": "IMAGE",
+          "link": 3
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "images",
+          "name": "images",
+          "type": "IMAGE",
+          "links": null
+        }
+      ],
+      "title": "验证 A：所有逻辑镜头起始画面",
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 5,
+      "type": "CompanyFixedColumnImagePreview",
+      "pos": [
+        1940,
+        0
+      ],
+      "size": [
+        1020,
+        520
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "localized_name": "图像",
+          "type": "IMAGE",
+          "link": 4
+        },
+        {
+          "name": "columns",
+          "localized_name": "每行图片数量",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "columns"
+          }
+        },
+        {
+          "name": "gap",
+          "localized_name": "图片间距",
+          "type": "INT",
+          "link": null,
+          "widget": {
+            "name": "gap"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "原始图片",
+          "localized_name": "原始图片",
+          "type": "IMAGE",
+          "links": []
+        }
+      ],
+      "title": "验证 B：每行固定 3 张（开始 / 中间 / 结束）",
+      "properties": {
+        "Node name for S&R": "CompanyFixedColumnImagePreview"
+      },
+      "widgets_values": [
+        "3",
+        8
+      ],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 6,
+      "type": "CompanyFixedColumnImagePreview",
+      "pos": [
+        1940,
+        620
+      ],
+      "size": [
+        700,
+        920
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "localized_name": "图像",
+          "type": "IMAGE",
+          "link": 5
+        },
+        {
+          "name": "columns",
+          "localized_name": "每行图片数量",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "columns"
+          }
+        },
+        {
+          "name": "gap",
+          "localized_name": "图片间距",
+          "type": "INT",
+          "link": null,
+          "widget": {
+            "name": "gap"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "原始图片",
+          "localized_name": "原始图片",
+          "type": "IMAGE",
+          "links": []
+        }
+      ],
+      "title": "验证 C：每行固定 2 张（切点前 / 切点后）",
+      "properties": {
+        "Node name for S&R": "CompanyFixedColumnImagePreview"
+      },
+      "widgets_values": [
+        "2",
+        8
+      ],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 7,
+      "type": "CompanyPersistentPromptDisplay",
+      "pos": [
+        520,
+        1120
+      ],
+      "size": [
+        560,
+        420
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "text",
+          "localized_name": "检测报告",
+          "type": "STRING",
+          "link": 6
+        }
+      ],
+      "outputs": [
+        {
+          "name": "检测报告",
+          "localized_name": "检测报告",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "title": "检测报告：镜头数量、切点时间与降级原因",
+      "properties": {
+        "Node name for S&R": "CompanyPersistentPromptDisplay"
+      },
+      "widgets_values": [],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 8,
+      "type": "CompanyPersistentPromptDisplay",
+      "pos": [
+        1220,
+        620
+      ],
+      "size": [
+        600,
+        520
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "text",
+          "localized_name": "检查报告",
+          "type": "STRING",
+          "link": 7
+        }
+      ],
+      "outputs": [
+        {
+          "name": "检查报告",
+          "localized_name": "检查报告",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "title": "检查报告：当前镜头时间范围与切点预览顺序",
+      "properties": {
+        "Node name for S&R": "CompanyPersistentPromptDisplay"
+      },
+      "widgets_values": [],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 9,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -920
+      ],
+      "size": [
+        900,
+        700
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "工作流总览｜只做本地分镜检测，不产生远端费用",
+      "properties": {},
+      "widgets_values": [
+        "# 工作流用途\n\n这是接手新环境后应最先运行的本地验证流程。它不调用 GPT、Seedance 或 Wan，只检查长视频能否被正确识别为逻辑镜头。\n\n## 整体思路\n\n`输入视频 → 检测镜头/转场 → 选择单个镜头 → 查看起始帧、首中尾帧、切点前后帧和报告`\n\n## 什么时候使用\n\n- 新环境安装完成后，先确认视频读取、FFmpeg 和 PySceneDetect 正常。\n- 更换新素材时，先用本流程确认切点，再进入付费生成流程。\n- 镜头切得过碎或漏切时，调整节点 2 的“灵敏度”；不要先修改后面的生成节点。\n\n> 本页中的 Markdown 笔记不参与执行，可安全保留在交付工作流中。"
+      ],
+      "color": "#30485f",
+      "bgcolor": "#3f607d"
+    },
+    {
+      "id": 10,
+      "type": "MarkdownNote",
+      "pos": [
+        980,
+        -920
+      ],
+      "size": [
+        940,
+        700
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "节点作用｜输入、检测与逐镜头检查",
+      "properties": {},
+      "widgets_values": [
+        "# 节点作用速查\n\n1. **输入待检测的长视频**：选择本次要检查的源视频。\n2. **检测硬切、淡入淡出和逻辑镜头**：本地分析整段视频，输出镜头计划、检测 JSON 和所有镜头起始帧。\n3. **选择镜头并播放检查**：填写镜头序号，截取并检查该镜头；可选导出全部检测镜头。\n4. **验证 A**：按时间顺序展示全部逻辑镜头的起始画面，用于快速判断是否漏切/误切。\n5. **验证 B**：每行固定显示“开始 / 中间 / 结束”三张图，确认单个镜头内部内容一致。\n6. **验证 C**：每行显示切点前后两张图，确认切点是否落在真实转场处。\n7/8. **检测与检查报告**：查看镜头数量、时间范围、切点顺序和降级原因。"
+      ],
+      "color": "#4b416d",
+      "bgcolor": "#62568b"
+    },
+    {
+      "id": 11,
+      "type": "MarkdownNote",
+      "pos": [
+        2000,
+        -920
+      ],
+      "size": [
+        960,
+        700
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "运行与验收｜先看全局，再逐镜头复核",
+      "properties": {},
+      "widgets_values": [
+        "# 建议运行顺序\n\n1. 在节点 1 重新选择交付环境中的视频。\n2. 先运行节点 2，查看节点 4 和节点 7 的全局结果。\n3. 在节点 3 从镜头序号 1 开始抽查，再查看节点 5、6、8。\n4. 若检测失败并自动降级，节点 7 会写明固定切分等降级原因。\n\n## 通过标准\n\n- 起始帧顺序与原视频剪辑顺序一致。\n- 切点前后画面确实发生镜头或转场变化。\n- 单个镜头的首中尾帧属于同一逻辑镜头。\n- 报告中无无法读取视频、空镜头计划或异常降级。\n\n**费用提示：**本工作流全程本地执行，不会产生远端模型费用。"
+      ],
+      "color": "#6b4f31",
+      "bgcolor": "#876640"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "VIDEO"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      0,
+      "长视频镜头计划"
+    ],
+    [
+      3,
+      2,
+      2,
+      4,
+      0,
+      "IMAGE"
+    ],
+    [
+      4,
+      3,
+      1,
+      5,
+      0,
+      "IMAGE"
+    ],
+    [
+      5,
+      3,
+      2,
+      6,
+      0,
+      "IMAGE"
+    ],
+    [
+      6,
+      2,
+      1,
+      7,
+      0,
+      "STRING"
+    ],
+    [
+      7,
+      3,
+      3,
+      8,
+      0,
+      "STRING"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "本地分镜检测",
+      "bounding": [
+        -60,
+        20,
+        1160,
+        980
+      ],
+      "color": "#3f789e",
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "逐镜头播放与切点核对",
+      "bounding": [
+        1150,
+        -60,
+        1870,
+        1660
+      ],
+      "color": "#81683e",
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "检测明细",
+      "bounding": [
+        460,
+        1060,
+        640,
+        540
+      ],
+      "color": "#6b5b95",
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "workflow_note": "分镜检测本地测试工作流：只检测和预览，不连接 GPT、Seedance 或 Wan。先观察镜头起始帧与切点前后帧，再通过镜头序号逐个播放检查。",
+    "long_video": {
+      "shot_detection_test": true,
+      "remote_requests": false
+    },
+    "company_remote_handover_notes": {
+      "version": 1,
+      "language": "zh-CN",
+      "node_type": "MarkdownNote",
+      "execution_impact": false
+    }
+  },
+  "version": 0.4
+}

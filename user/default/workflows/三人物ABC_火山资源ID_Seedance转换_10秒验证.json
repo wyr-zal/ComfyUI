@@ -1,0 +1,790 @@
+{
+  "id": "039877d1-7845-4653-a80c-6c30b1541f10",
+  "revision": 0,
+  "last_node_id": 10,
+  "last_link_id": 9,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadVideo",
+      "pos": [
+        40,
+        520
+      ],
+      "size": [
+        400,
+        420
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "文件",
+          "name": "file",
+          "type": "COMBO",
+          "widget": {
+            "name": "file"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "选择要上传的文件",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "视频",
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "slot_index": 0,
+          "links": [
+            1
+          ]
+        }
+      ],
+      "title": "1. 十秒验证视频（固定 24 FPS，已包含 A/B/C）",
+      "properties": {
+        "Node name for S&R": "LoadVideo"
+      },
+      "widgets_values": [
+        "three_person_asset_gateway_test_10s_24fps.mp4",
+        "image"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "LoadImage",
+      "pos": [
+        520,
+        20
+      ],
+      "size": [
+        400,
+        420
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "图像",
+          "name": "image",
+          "type": "COMBO",
+          "widget": {
+            "name": "image"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "选择文件上传",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "图像",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            2
+          ]
+        },
+        {
+          "localized_name": "遮罩",
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "title": "2A. 人物 A：车旁左侧 → 酒红官服人物",
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "three_person_asset_A_red_official.png",
+        "image"
+      ]
+    },
+    {
+      "id": 3,
+      "type": "LoadImage",
+      "pos": [
+        520,
+        520
+      ],
+      "size": [
+        400,
+        420
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "图像",
+          "name": "image",
+          "type": "COMBO",
+          "widget": {
+            "name": "image"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "选择文件上传",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "图像",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            3
+          ]
+        },
+        {
+          "localized_name": "遮罩",
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "title": "2B. 人物 B：车旁右侧 → 浅绿官服人物",
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "three_person_asset_B_green_official.png",
+        "image"
+      ]
+    },
+    {
+      "id": 4,
+      "type": "LoadImage",
+      "pos": [
+        520,
+        1020
+      ],
+      "size": [
+        400,
+        420
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "图像",
+          "name": "image",
+          "type": "COMBO",
+          "widget": {
+            "name": "image"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "选择文件上传",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "图像",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            4
+          ]
+        },
+        {
+          "localized_name": "遮罩",
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "title": "2C. 人物 C：灰西装单人 → 黑甲武将",
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "three_person_asset_C_black_warrior.png",
+        "image"
+      ]
+    },
+    {
+      "id": 5,
+      "type": "CompanySeedanceVideoABCAssetCreate",
+      "pos": [
+        1040,
+        430
+      ],
+      "size": [
+        610,
+        560
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 4,
+      "inputs": [
+        {
+          "localized_name": "源视频（建议先裁到 4-15 秒）",
+          "name": "video",
+          "type": "VIDEO",
+          "link": 1
+        },
+        {
+          "localized_name": "人物 A 参考图",
+          "name": "image_a",
+          "type": "IMAGE",
+          "link": 2
+        },
+        {
+          "localized_name": "人物 B 参考图",
+          "name": "image_b",
+          "type": "IMAGE",
+          "link": 3
+        },
+        {
+          "localized_name": "人物 C 参考图",
+          "name": "image_c",
+          "type": "IMAGE",
+          "link": 4
+        },
+        {
+          "localized_name": "复用相同素材的资产 ID",
+          "name": "reuse_cached",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "reuse_cached"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "源视频资产 ID",
+          "name": "源视频资产 ID",
+          "type": "STRING",
+          "slot_index": 0,
+          "links": [
+            5
+          ]
+        },
+        {
+          "localized_name": "人物 A 资产 ID",
+          "name": "人物 A 资产 ID",
+          "type": "STRING",
+          "slot_index": 1,
+          "links": [
+            6
+          ]
+        },
+        {
+          "localized_name": "人物 B 资产 ID",
+          "name": "人物 B 资产 ID",
+          "type": "STRING",
+          "slot_index": 2,
+          "links": [
+            7
+          ]
+        },
+        {
+          "localized_name": "人物 C 资产 ID",
+          "name": "人物 C 资产 ID",
+          "type": "STRING",
+          "slot_index": 3,
+          "links": [
+            8
+          ]
+        },
+        {
+          "localized_name": "汇总报告 JSON",
+          "name": "汇总报告 JSON",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "title": "3. 先 TOS，再并行注册 Video + A/B/C 四个资产（默认停用）",
+      "properties": {
+        "Node name for S&R": "CompanySeedanceVideoABCAssetCreate"
+      },
+      "widgets_values": [
+        true
+      ],
+      "color": "#6b5338",
+      "bgcolor": "#896c49"
+    },
+    {
+      "id": 6,
+      "type": "CompanySeedanceAssetGatewayThreePersonVideo",
+      "pos": [
+        1780,
+        330
+      ],
+      "size": [
+        760,
+        900
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 4,
+      "inputs": [
+        {
+          "localized_name": "源视频资产 ID",
+          "name": "source_video_asset_id",
+          "type": "STRING",
+          "link": 5
+        },
+        {
+          "localized_name": "人物 A 资产 ID（参考图 1）",
+          "name": "character_a_asset_id",
+          "type": "STRING",
+          "link": 6
+        },
+        {
+          "localized_name": "人物 B 资产 ID（参考图 2）",
+          "name": "character_b_asset_id",
+          "type": "STRING",
+          "link": 7
+        },
+        {
+          "localized_name": "人物 C 资产 ID（参考图 3）",
+          "name": "character_c_asset_id",
+          "type": "STRING",
+          "link": 8
+        },
+        {
+          "localized_name": "三人物映射提示词",
+          "name": "prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "prompt"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "模型",
+          "name": "model",
+          "type": "COMBO",
+          "widget": {
+            "name": "model"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "分辨率",
+          "name": "resolution",
+          "type": "COMBO",
+          "widget": {
+            "name": "resolution"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "比例",
+          "name": "ratio",
+          "type": "COMBO",
+          "widget": {
+            "name": "ratio"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "输出时长（秒）",
+          "name": "duration",
+          "type": "INT",
+          "widget": {
+            "name": "duration"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "生成音频",
+          "name": "generate_audio",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "generate_audio"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "水印",
+          "name": "watermark",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "watermark"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "种子",
+          "name": "seed",
+          "type": "INT",
+          "widget": {
+            "name": "seed"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "继续轮询已有任务 ID",
+          "name": "resume_task_id",
+          "type": "STRING",
+          "widget": {
+            "name": "resume_task_id"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "生成视频",
+          "name": "生成视频",
+          "type": "VIDEO",
+          "slot_index": 0,
+          "links": [
+            9
+          ]
+        },
+        {
+          "localized_name": "输出路径",
+          "name": "输出路径",
+          "type": "STRING",
+          "links": []
+        },
+        {
+          "localized_name": "任务 ID",
+          "name": "任务 ID",
+          "type": "STRING",
+          "links": []
+        },
+        {
+          "localized_name": "报告 JSON",
+          "name": "报告 JSON",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "title": "4. 用同一网关的资产 ID 生成三人物转换视频（默认停用）",
+      "properties": {
+        "Node name for S&R": "CompanySeedanceAssetGatewayThreePersonVideo"
+      },
+      "widgets_values": [
+        "",
+        "",
+        "",
+        "",
+        "严格参照源视频资产保留原有镜头、剪辑顺序、机位、动作、身体姿态、服装、车辆、道路、背景、光线和节奏，只转换三位人物的脸部身份与头部造型。\n参考图 1 是人物 A：源视频车旁双人镜头中画面左侧人物，转换为酒红官服人物。\n参考图 2 是人物 B：源视频车旁双人镜头中画面右侧、低头人物，转换为浅绿官服人物。\n参考图 3 是人物 C：源视频灰西装单人镜头中的人物，转换为黑甲武将。\nA、B、C 身份必须固定且互不串脸；同一人物跨镜头保持一致。不得改变人物数量，不新增人物，不删除人物，不交换左右位置，不改变原背景与剧情，不参考三张人物图的背景。画面真实、自然、稳定。",
+        "doubao-seedance-2-0-fast-260128",
+        "480p",
+        "adaptive",
+        10,
+        false,
+        false,
+        0,
+        ""
+      ],
+      "color": "#35534a",
+      "bgcolor": "#446b5f"
+    },
+    {
+      "id": 7,
+      "type": "SaveVideo",
+      "pos": [
+        2700,
+        520
+      ],
+      "size": [
+        390,
+        520
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 4,
+      "inputs": [
+        {
+          "localized_name": "视频",
+          "name": "video",
+          "type": "VIDEO",
+          "link": 9
+        },
+        {
+          "localized_name": "文件名前缀",
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "格式",
+          "name": "format",
+          "type": "COMBO",
+          "widget": {
+            "name": "format"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "编码器",
+          "name": "codec",
+          "type": "COMBO",
+          "widget": {
+            "name": "codec"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "video",
+          "name": "video",
+          "type": "VIDEO",
+          "links": null
+        }
+      ],
+      "title": "5. 保存验证结果（默认停用）",
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "video/three_person_asset_gateway_test",
+        "auto",
+        "auto"
+      ]
+    },
+    {
+      "id": 8,
+      "type": "MarkdownNote",
+      "pos": [
+        40,
+        -900
+      ],
+      "size": [
+        950,
+        700
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "工作流总览｜TOS/火山资产 ID + Seedance 三人物验证",
+      "properties": {},
+      "widgets_values": [
+        "# 工作流用途\n\n验证同一资产网关内“源视频 + 人物 A/B/C 三张图”的注册、资产 ID 传递和 Seedance 三人物转换链路。\n\n## 整体思路\n\n`10 秒 24 FPS 视频 + 三张人物图 → TOS 上传并注册四个资产 → 把四个 asset_id 交给同一 Seedance 网关 → 生成 10 秒验证视频 → 保存`\n\n该流程用于验证资产网关，不是通用长视频生产入口。工作流只保存引用关系，不包含实际素材、凭据或远端资产本体。"
+      ],
+      "color": "#30485f",
+      "bgcolor": "#3f607d"
+    },
+    {
+      "id": 9,
+      "type": "MarkdownNote",
+      "pos": [
+        1050,
+        -900
+      ],
+      "size": [
+        1000,
+        700
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "节点作用｜输入与资产注册（先单独验证）",
+      "properties": {},
+      "widgets_values": [
+        "# 节点 1–5\n\n1. **10 秒源视频**：要求固定 24 FPS，并且已包含人物 A/B/C。\n2/3/4. **人物 A/B/C 参考图**：顺序决定后续四个 asset_id 输入的身份含义。\n5. **资产创建**：先上传 TOS，再并行注册 1 个 Video 资产和 3 个 Image 资产；可按内容 Hash 复用已注册资产。\n\n节点 5 当前为 `mode=4`（默认停用）。建议先只启用并运行节点 5，检查汇总报告和四个 asset_id 均有效，再进入视频生成。上传和注册需要接手方自己的 TOS/资产网关配置。"
+      ],
+      "color": "#4b416d",
+      "bgcolor": "#62568b"
+    },
+    {
+      "id": 10,
+      "type": "MarkdownNote",
+      "pos": [
+        2150,
+        -900
+      ],
+      "size": [
+        1050,
+        700
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "节点作用与执行顺序｜付费生成默认停用",
+      "properties": {},
+      "widgets_values": [
+        "# 节点 6–7\n\n6. **Seedance 资产网关生成**：使用同一网关中的源视频、A、B、C 四个 asset_id 和映射提示词生成视频；可填写已有任务 ID 继续轮询。当前保存参数为 480p、自适应比例、10 秒、不生成音频。\n7. **保存验证结果**：保存节点 6 返回的视频。\n\n## 安全执行顺序\n\n1. 重新选择已授权的输入素材。\n2. 启用节点 5，确认资产注册成功。\n3. 再启用节点 6 和 7，复核提示词中的 A/B/C 映射后提交付费任务。\n\n节点 5、6、7 当前全部 `mode=4`，因此加载工作流不会自动注册资产或产生视频费用。"
+      ],
+      "color": "#6b4f31",
+      "bgcolor": "#876640"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      5,
+      0,
+      "VIDEO"
+    ],
+    [
+      2,
+      2,
+      0,
+      5,
+      1,
+      "IMAGE"
+    ],
+    [
+      3,
+      3,
+      0,
+      5,
+      2,
+      "IMAGE"
+    ],
+    [
+      4,
+      4,
+      0,
+      5,
+      3,
+      "IMAGE"
+    ],
+    [
+      5,
+      5,
+      0,
+      6,
+      0,
+      "STRING"
+    ],
+    [
+      6,
+      5,
+      1,
+      6,
+      1,
+      "STRING"
+    ],
+    [
+      7,
+      5,
+      2,
+      6,
+      2,
+      "STRING"
+    ],
+    [
+      8,
+      5,
+      3,
+      6,
+      3,
+      "STRING"
+    ],
+    [
+      9,
+      6,
+      0,
+      7,
+      0,
+      "VIDEO"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "A. 已准备的 10 秒源视频与三张人物参考图",
+      "bounding": [
+        -10,
+        -40,
+        960,
+        1540
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "B. 远程资产注册：会上传素材，先启用节点 3",
+      "bounding": [
+        980,
+        350,
+        730,
+        720
+      ],
+      "color": "#8f6f4e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "C. Seedance 10 秒验证：会产生费用，再启用节点 4/5",
+      "bounding": [
+        1720,
+        250,
+        1430,
+        1060
+      ],
+      "color": "#4f7f69",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.58,
+      "offset": [
+        80,
+        60
+      ]
+    },
+    "frontendVersion": "1.25.9",
+    "workflowRendererVersion": "LG",
+    "company_remote_handover_notes": {
+      "version": 1,
+      "language": "zh-CN",
+      "node_type": "MarkdownNote",
+      "execution_impact": false
+    }
+  },
+  "version": 0.4
+}

@@ -1,0 +1,1285 @@
+{
+  "id": "aac1adbf-0bbd-5bf6-afee-d12991e28f4f",
+  "revision": 0,
+  "last_node_id": 19,
+  "last_link_id": 14,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadVideo",
+      "pos": [
+        0,
+        320
+      ],
+      "size": [
+        420.40625,
+        347.296875
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "文件",
+          "name": "file",
+          "type": "COMBO",
+          "widget": {
+            "name": "file"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "选择要上传的文件",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "视频",
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            1
+          ]
+        }
+      ],
+      "title": "1. 输入测试视频",
+      "properties": {
+        "Node name for S&R": "LoadVideo"
+      },
+      "widgets_values": [
+        "",
+        "image"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "CompanyLongVideoShotDetector",
+      "pos": [
+        500,
+        240
+      ],
+      "size": [
+        560,
+        430
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "localized_name": "长视频",
+          "type": "VIDEO",
+          "link": 1
+        },
+        {
+          "name": "mode",
+          "localized_name": "切分模式",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "mode"
+          }
+        },
+        {
+          "name": "fixed_duration",
+          "localized_name": "固定分段时长（秒）",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "fixed_duration"
+          }
+        },
+        {
+          "name": "sensitivity",
+          "localized_name": "镜头检测灵敏度",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "sensitivity"
+          }
+        },
+        {
+          "name": "use_audio_silence",
+          "localized_name": "用音频停顿辅助长镜头切分",
+          "type": "BOOLEAN",
+          "link": null,
+          "widget": {
+            "name": "use_audio_silence"
+          }
+        },
+        {
+          "name": "auto_fallback",
+          "localized_name": "检测失败自动改用固定切分",
+          "type": "BOOLEAN",
+          "link": null,
+          "widget": {
+            "name": "auto_fallback"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "镜头计划",
+          "localized_name": "镜头计划",
+          "type": "长视频镜头计划",
+          "links": [
+            3
+          ]
+        },
+        {
+          "name": "镜头检测 JSON",
+          "localized_name": "镜头检测 JSON",
+          "type": "STRING",
+          "links": []
+        },
+        {
+          "name": "镜头起始帧预览",
+          "localized_name": "镜头起始帧预览",
+          "type": "IMAGE",
+          "links": [
+            2
+          ]
+        }
+      ],
+      "title": "2. 检测完整视频分镜",
+      "properties": {
+        "Node name for S&R": "CompanyLongVideoShotDetector"
+      },
+      "widgets_values": [
+        "镜头优先（推荐）",
+        "10",
+        "标准",
+        true,
+        true
+      ],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 3,
+      "type": "CompanyFixedColumnImagePreview",
+      "pos": [
+        500,
+        760
+      ],
+      "size": [
+        920,
+        520
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "localized_name": "图像",
+          "type": "IMAGE",
+          "link": 2
+        },
+        {
+          "name": "columns",
+          "localized_name": "每行图片数量",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "columns"
+          }
+        },
+        {
+          "name": "gap",
+          "localized_name": "图片间距",
+          "type": "INT",
+          "link": null,
+          "widget": {
+            "name": "gap"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "原始图片",
+          "localized_name": "原始图片",
+          "type": "IMAGE",
+          "links": []
+        }
+      ],
+      "title": "按顺序确认：分镜起始画面（左到右、上到下，从 1 开始）",
+      "properties": {
+        "Node name for S&R": "CompanyFixedColumnImagePreview"
+      },
+      "widgets_values": [
+        "3",
+        8
+      ],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 4,
+      "type": "CompanyLongVideoContinuityRangeSelector",
+      "pos": [
+        1500,
+        240
+      ],
+      "size": [
+        560,
+        360
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "shot_plan",
+          "localized_name": "镜头计划",
+          "type": "长视频镜头计划",
+          "link": 3
+        },
+        {
+          "name": "start_shot",
+          "localized_name": "起始镜头序号",
+          "type": "INT",
+          "link": null,
+          "widget": {
+            "name": "start_shot"
+          }
+        },
+        {
+          "name": "shot_count",
+          "localized_name": "连续镜头数量（0=全部剩余）",
+          "type": "INT",
+          "link": null,
+          "widget": {
+            "name": "shot_count"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "选中范围镜头计划",
+          "localized_name": "选中范围镜头计划",
+          "type": "长视频镜头计划",
+          "links": [
+            5
+          ]
+        },
+        {
+          "name": "选中范围原视频",
+          "localized_name": "选中范围原视频",
+          "type": "VIDEO",
+          "links": []
+        },
+        {
+          "name": "范围选择报告 JSON",
+          "localized_name": "范围选择报告 JSON",
+          "type": "STRING",
+          "links": [
+            4
+          ]
+        }
+      ],
+      "title": "3. 选择连续 1-3 个分镜作为测试范围",
+      "properties": {
+        "Node name for S&R": "CompanyLongVideoContinuityRangeSelector"
+      },
+      "widgets_values": [
+        1,
+        0
+      ],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 5,
+      "type": "CompanyPersistentPromptDisplay",
+      "pos": [
+        1500,
+        700
+      ],
+      "size": [
+        560,
+        500
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "text",
+          "localized_name": "范围选择报告",
+          "type": "STRING",
+          "link": 4
+        }
+      ],
+      "outputs": [
+        {
+          "name": "范围选择报告",
+          "localized_name": "范围选择报告",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "title": "检查：选中的原镜头编号和时间范围",
+      "properties": {
+        "Node name for S&R": "CompanyPersistentPromptDisplay"
+      },
+      "widgets_values": [],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 6,
+      "type": "CompanyLongVideoAssetLoader",
+      "pos": [
+        1500,
+        -560
+      ],
+      "size": [
+        560,
+        680
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "assets_manifest",
+          "localized_name": "资产清单 JSON 或路径",
+          "type": "STRING",
+          "link": null,
+          "widget": {
+            "name": "assets_manifest"
+          }
+        },
+        {
+          "name": "person_A",
+          "localized_name": "欧美化人物 A",
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "person_B",
+          "localized_name": "欧美化人物 B",
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "person_C",
+          "localized_name": "欧美化人物 C",
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "BG01",
+          "localized_name": "欧美化背景 BG01",
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "BG02",
+          "localized_name": "欧美化背景 BG02",
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "BG03",
+          "localized_name": "欧美化背景 BG03",
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "BG04",
+          "localized_name": "欧美化背景 BG04",
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "BG05",
+          "localized_name": "欧美化背景 BG05",
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "BG06",
+          "localized_name": "欧美化背景 BG06",
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "BG07",
+          "localized_name": "欧美化背景 BG07",
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "BG08",
+          "localized_name": "欧美化背景 BG08",
+          "type": "IMAGE",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "已加载资产",
+          "localized_name": "已加载资产",
+          "type": "长视频资产清单",
+          "links": [
+            6
+          ]
+        },
+        {
+          "name": "资产摘要 JSON",
+          "localized_name": "资产摘要 JSON",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "title": "4. 读取第一阶段确认的欧美化资产",
+      "properties": {
+        "Node name for S&R": "CompanyLongVideoAssetLoader"
+      },
+      "widgets_values": [
+        ""
+      ],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 7,
+      "type": "CompanyLongVideoDurationAdapter",
+      "pos": [
+        2200,
+        -60
+      ],
+      "size": [
+        630,
+        650
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "shot_plan",
+          "localized_name": "选中范围镜头计划",
+          "type": "长视频镜头计划",
+          "link": 5
+        },
+        {
+          "name": "assets",
+          "localized_name": "已加载资产",
+          "type": "长视频资产清单",
+          "link": 6
+        },
+        {
+          "name": "prompt",
+          "localized_name": "视频提示词",
+          "type": "STRING",
+          "link": null,
+          "widget": {
+            "name": "prompt"
+          }
+        },
+        {
+          "name": "engine",
+          "localized_name": "视频引擎",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "engine"
+          }
+        },
+        {
+          "name": "model",
+          "localized_name": "模型",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "model"
+          }
+        },
+        {
+          "name": "analysis_model",
+          "localized_name": "分段分析模型",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "analysis_model"
+          }
+        },
+        {
+          "name": "max_retries",
+          "localized_name": "每段最大重试次数",
+          "type": "INT",
+          "link": null,
+          "widget": {
+            "name": "max_retries"
+          }
+        },
+        {
+          "name": "resume",
+          "localized_name": "复用已完成分段",
+          "type": "BOOLEAN",
+          "link": null,
+          "widget": {
+            "name": "resume"
+          }
+        },
+        {
+          "name": "force_rerun",
+          "localized_name": "强制重跑全部分段",
+          "type": "BOOLEAN",
+          "link": null,
+          "widget": {
+            "name": "force_rerun"
+          }
+        },
+        {
+          "name": "negative_prompt",
+          "localized_name": "负面提示词",
+          "type": "STRING",
+          "link": null,
+          "widget": {
+            "name": "negative_prompt"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "长视频任务",
+          "localized_name": "长视频任务",
+          "type": "长视频分段任务",
+          "links": [
+            8
+          ]
+        },
+        {
+          "name": "时长适配计划 JSON",
+          "localized_name": "时长适配计划 JSON",
+          "type": "STRING",
+          "links": [
+            7
+          ]
+        },
+        {
+          "name": "任务 manifest 路径",
+          "localized_name": "任务 manifest 路径",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "title": "5. 只为选中范围建立生成任务",
+      "properties": {
+        "Node name for S&R": "CompanyLongVideoDurationAdapter"
+      },
+      "widgets_values": [
+        "按照选中连续分镜的原剧情、动作、镜头和节奏重新演绎。参考人物与背景是最终外观标准；保持人物数量、身份对应和场景关系。从第二段开始参考上一生成分段末帧，保持动作方向、空间位置和视觉风格连续。",
+        "Seedance 2.0",
+        "Seedance 2.0 Fast",
+        "gpt-5.4",
+        1,
+        true,
+        false,
+        "人物肢体结构错误，身份交换，人物增减，背景跳变，镜头方向无原因突变"
+      ],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 8,
+      "type": "CompanyPersistentPromptDisplay",
+      "pos": [
+        2200,
+        720
+      ],
+      "size": [
+        630,
+        500
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "text",
+          "localized_name": "时长适配计划",
+          "type": "STRING",
+          "link": 7
+        }
+      ],
+      "outputs": [
+        {
+          "name": "时长适配计划",
+          "localized_name": "时长适配计划",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "title": "检查：实际将发送多少个模型请求",
+      "properties": {
+        "Node name for S&R": "CompanyPersistentPromptDisplay"
+      },
+      "widgets_values": [],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 9,
+      "type": "CompanyLongVideoSegmentAnalyzer",
+      "pos": [
+        3000,
+        0
+      ],
+      "size": [
+        470,
+        300
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "job",
+          "localized_name": "长视频任务",
+          "type": "长视频分段任务",
+          "link": 8
+        }
+      ],
+      "outputs": [
+        {
+          "name": "已分析任务",
+          "localized_name": "已分析任务",
+          "type": "长视频分段任务",
+          "links": [
+            9
+          ]
+        },
+        {
+          "name": "分析结果 JSON",
+          "localized_name": "分析结果 JSON",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "title": "6. GPT 识别每段人物、背景和动作",
+      "properties": {
+        "Node name for S&R": "CompanyLongVideoSegmentAnalyzer"
+      },
+      "widgets_values": [],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 10,
+      "type": "CompanyLongVideoReferenceMatcher",
+      "pos": [
+        3600,
+        0
+      ],
+      "size": [
+        500,
+        320
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "job",
+          "localized_name": "已分析任务",
+          "type": "长视频分段任务",
+          "link": 9
+        }
+      ],
+      "outputs": [
+        {
+          "name": "已匹配任务",
+          "localized_name": "已匹配任务",
+          "type": "长视频分段任务",
+          "links": [
+            10
+          ]
+        },
+        {
+          "name": "匹配结果 JSON",
+          "localized_name": "匹配结果 JSON",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "title": "7. 为每段匹配人物、背景和连续性参考",
+      "properties": {
+        "Node name for S&R": "CompanyLongVideoReferenceMatcher"
+      },
+      "widgets_values": [],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 11,
+      "type": "CompanyLongVideoSegmentGenerator",
+      "pos": [
+        4250,
+        0
+      ],
+      "size": [
+        500,
+        330
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "job",
+          "localized_name": "已匹配任务",
+          "type": "长视频分段任务",
+          "link": 10
+        }
+      ],
+      "outputs": [
+        {
+          "name": "已生成任务",
+          "localized_name": "已生成任务",
+          "type": "长视频分段任务",
+          "links": [
+            11
+          ]
+        },
+        {
+          "name": "生成状态 JSON",
+          "localized_name": "生成状态 JSON",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "title": "8. 顺序生成选中的连续分镜",
+      "properties": {
+        "Node name for S&R": "CompanyLongVideoSegmentGenerator"
+      },
+      "widgets_values": [],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 12,
+      "type": "CompanyLongVideoContinuityPreview",
+      "pos": [
+        4900,
+        0
+      ],
+      "size": [
+        720,
+        620
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "job",
+          "localized_name": "已生成任务",
+          "type": "长视频分段任务",
+          "link": 11
+        }
+      ],
+      "outputs": [
+        {
+          "name": "可合并任务",
+          "localized_name": "可合并任务",
+          "type": "长视频分段任务",
+          "links": [
+            13
+          ]
+        },
+        {
+          "name": "连续性检查 JSON",
+          "localized_name": "连续性检查 JSON",
+          "type": "STRING",
+          "links": []
+        },
+        {
+          "name": "各段末帧",
+          "localized_name": "各段末帧",
+          "type": "IMAGE",
+          "links": [
+            12
+          ]
+        }
+      ],
+      "title": "9. 逐段播放并检查连续性",
+      "properties": {
+        "Node name for S&R": "CompanyLongVideoContinuityPreview"
+      },
+      "widgets_values": [],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 13,
+      "type": "CompanyFixedColumnImagePreview",
+      "pos": [
+        4900,
+        760
+      ],
+      "size": [
+        900,
+        500
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "localized_name": "图像",
+          "type": "IMAGE",
+          "link": 12
+        },
+        {
+          "name": "columns",
+          "localized_name": "每行图片数量",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "columns"
+          }
+        },
+        {
+          "name": "gap",
+          "localized_name": "图片间距",
+          "type": "INT",
+          "link": null,
+          "widget": {
+            "name": "gap"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "原始图片",
+          "localized_name": "原始图片",
+          "type": "IMAGE",
+          "links": []
+        }
+      ],
+      "title": "对比：每个生成分段的末帧（每行 3 张）",
+      "properties": {
+        "Node name for S&R": "CompanyFixedColumnImagePreview"
+      },
+      "widgets_values": [
+        "3",
+        8
+      ],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 14,
+      "type": "CompanyLongVideoFinalMerger",
+      "pos": [
+        5800,
+        0
+      ],
+      "size": [
+        520,
+        380
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "job",
+          "localized_name": "可合并任务",
+          "type": "长视频分段任务",
+          "link": 13
+        }
+      ],
+      "outputs": [
+        {
+          "name": "最终视频",
+          "localized_name": "最终视频",
+          "type": "VIDEO",
+          "links": [
+            14
+          ]
+        },
+        {
+          "name": "最终视频路径",
+          "localized_name": "最终视频路径",
+          "type": "STRING",
+          "links": []
+        },
+        {
+          "name": "任务 manifest 路径",
+          "localized_name": "任务 manifest 路径",
+          "type": "STRING",
+          "links": []
+        },
+        {
+          "name": "任务状态 JSON",
+          "localized_name": "任务状态 JSON",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "title": "10. 合并本次测试分镜并恢复对应原音频",
+      "properties": {
+        "Node name for S&R": "CompanyLongVideoFinalMerger"
+      },
+      "widgets_values": [],
+      "color": "#234",
+      "bgcolor": "#345"
+    },
+    {
+      "id": 15,
+      "type": "SaveVideo",
+      "pos": [
+        6470,
+        0
+      ],
+      "size": [
+        270,
+        334
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "localized_name": "视频",
+          "type": "VIDEO",
+          "link": 14
+        },
+        {
+          "name": "filename_prefix",
+          "localized_name": "文件名前缀",
+          "type": "STRING",
+          "link": null,
+          "widget": {
+            "name": "filename_prefix"
+          }
+        },
+        {
+          "name": "format",
+          "localized_name": "格式",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "format"
+          }
+        },
+        {
+          "name": "codec",
+          "localized_name": "编码器",
+          "type": "COMBO",
+          "link": null,
+          "widget": {
+            "name": "codec"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "video",
+          "name": "video",
+          "type": "VIDEO",
+          "links": null
+        }
+      ],
+      "properties": {},
+      "widgets_values": [
+        "video/LongVideoContinuityTest",
+        "auto",
+        "auto"
+      ],
+      "title": "保存连续分镜测试视频"
+    },
+    {
+      "id": 16,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -1500
+      ],
+      "size": [
+        1200,
+        760
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "工作流总览｜用 1–3 个连续镜头做低成本端到端验证",
+      "properties": {},
+      "widgets_values": [
+        "# 工作流用途\n\n在正式处理长视频前，只选择少量连续镜头，验证“分镜、资产、分析、参考匹配、Seedance 生成、连续性检查、合并和音频恢复”整条链路。\n\n## 整体思路\n\n`输入 → 检测分镜 → 选择连续小范围 + 加载已确认资产 → 建立请求 → GPT 分析 → 匹配参考 → Seedance 顺序生成 → 检查 → 合并并恢复对应原音频`\n\n## 推荐范围\n\n首次验收设置 **1–3 个连续镜头**。节点 4 的镜头数量填 `0` 会选择全部剩余镜头，不适合作为首次低成本验证。\n\n> 本流程包含远端分析和视频生成；先检查范围与资产，再运行付费节点。"
+      ],
+      "color": "#30485f",
+      "bgcolor": "#3f607d"
+    },
+    {
+      "id": 17,
+      "type": "MarkdownNote",
+      "pos": [
+        1300,
+        -1500
+      ],
+      "size": [
+        1550,
+        760
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "节点作用｜分镜选择、资产与请求计划",
+      "properties": {},
+      "widgets_values": [
+        "# 前半段节点\n\n1. **输入测试视频**：选择源视频。\n2. **检测完整视频分镜**：本地生成镜头计划和起始帧。\n3. **分镜起始画面预览**：按左到右、上到下核对镜头序号。\n4. **选择连续分镜**：指定起始镜头和连续数量，只截取本次测试范围。\n5. **范围报告**：确认实际选择的原镜头编号和时间范围。\n6. **读取已确认资产**：加载第一阶段确认的人物 A/B/C 与背景资产，或填写资产 manifest。\n7. **建立生成任务**：把选中镜头适配为合法模型请求，设置引擎、模型、提示词、重试和断点恢复。\n8. **请求数量报告**：运行付费阶段前，先确认实际将提交多少次模型请求。"
+      ],
+      "color": "#4b416d",
+      "bgcolor": "#62568b"
+    },
+    {
+      "id": 18,
+      "type": "MarkdownNote",
+      "pos": [
+        2950,
+        -1500
+      ],
+      "size": [
+        1750,
+        760
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "节点作用｜分析、生成、审阅与合并",
+      "properties": {},
+      "widgets_values": [
+        "# 后半段节点\n\n9. **GPT 分段分析**：识别每段出现的人物、背景、动作和剧情；属于远端文本调用。\n10. **参考匹配**：为每段匹配人物、背景及连续性参考。\n11. **Seedance 顺序生成**：按顺序提交选中范围；这是主要付费阶段。\n12. **连续性预览**：逐段播放生成结果，输出每段末帧。\n13. **末帧网格**：集中检查身份、动作方向、构图和风格是否跳变。\n14. **最终合并**：合并本次测试范围并恢复相同时间范围的原音频。\n15. **保存视频**：把测试结果保存到输出目录。\n\n从第 2 个生成分段开始，上一段末帧只作为软连续性参考，不能替代人工审阅。"
+      ],
+      "color": "#4b416d",
+      "bgcolor": "#62568b"
+    },
+    {
+      "id": 19,
+      "type": "MarkdownNote",
+      "pos": [
+        4800,
+        -1500
+      ],
+      "size": [
+        1900,
+        760
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "执行与验收｜付费前检查四件事",
+      "properties": {},
+      "widgets_values": [
+        "# 执行前\n\n1. 节点 4 的范围确实只有 1–3 个镜头。\n2. 节点 5 报告中的时间范围与预期一致。\n3. 节点 6 的人物/背景资产已经人工确认，A/B/C 身份映射没有颠倒。\n4. 节点 8 显示的请求数量和预计费用可接受。\n\n# 生成后\n\n- 在节点 12 逐段检查人物身份、场景、动作方向和镜头连续性。\n- 在节点 13 对比相邻末帧，异常时优先重跑问题段，不要直接扩大范围。\n- 检查节点 15 输出视频的时长、帧率和音频是否与所选原片范围一致。\n\n**费用边界：**节点 9 调用文本模型，节点 11 调用 Seedance；分镜检测、范围选择、预览和最终合并为本地步骤。"
+      ],
+      "color": "#6b4f31",
+      "bgcolor": "#876640"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "VIDEO"
+    ],
+    [
+      2,
+      2,
+      2,
+      3,
+      0,
+      "IMAGE"
+    ],
+    [
+      3,
+      2,
+      0,
+      4,
+      0,
+      "长视频镜头计划"
+    ],
+    [
+      4,
+      4,
+      2,
+      5,
+      0,
+      "STRING"
+    ],
+    [
+      5,
+      4,
+      0,
+      7,
+      0,
+      "长视频镜头计划"
+    ],
+    [
+      6,
+      6,
+      0,
+      7,
+      1,
+      "长视频资产清单"
+    ],
+    [
+      7,
+      7,
+      1,
+      8,
+      0,
+      "STRING"
+    ],
+    [
+      8,
+      7,
+      0,
+      9,
+      0,
+      "长视频分段任务"
+    ],
+    [
+      9,
+      9,
+      0,
+      10,
+      0,
+      "长视频分段任务"
+    ],
+    [
+      10,
+      10,
+      0,
+      11,
+      0,
+      "长视频分段任务"
+    ],
+    [
+      11,
+      11,
+      0,
+      12,
+      0,
+      "长视频分段任务"
+    ],
+    [
+      12,
+      12,
+      2,
+      13,
+      0,
+      "IMAGE"
+    ],
+    [
+      13,
+      12,
+      0,
+      14,
+      0,
+      "长视频分段任务"
+    ],
+    [
+      14,
+      14,
+      0,
+      15,
+      0,
+      "VIDEO"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "A. 检测并选择连续分镜",
+      "bounding": [
+        -60,
+        160,
+        2120,
+        1160
+      ],
+      "color": "#3f789e",
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "B. 加载已确认欧美化资产",
+      "bounding": [
+        1440,
+        -620,
+        660,
+        740
+      ],
+      "color": "#6b5b95",
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "C. 逐步分析、匹配和顺序生成",
+      "bounding": [
+        2140,
+        -120,
+        3520,
+        1400
+      ],
+      "color": "#81683e",
+      "flags": {}
+    },
+    {
+      "id": 4,
+      "title": "D. 合并并保存本次测试结果",
+      "bounding": [
+        5740,
+        -100,
+        1260,
+        620
+      ],
+      "color": "#4f7f69",
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "workflow_note": "连续分镜远端生成测试工作流：先检测分镜，再选择连续 1-3 个镜头，仅生成这个小范围。从第 2 个生成分段开始自动加入上一段末帧作为软连续性参考；每段视频、末帧和合并结果均可检查。",
+    "long_video": {
+      "continuity_generation_test": true,
+      "max_selected_shots": 3,
+      "remote_requests": true,
+      "continuity": "soft_previous_end_frame"
+    },
+    "company_remote_handover_notes": {
+      "version": 1,
+      "language": "zh-CN",
+      "node_type": "MarkdownNote",
+      "execution_impact": false
+    }
+  },
+  "version": 0.4
+}

@@ -1,0 +1,1521 @@
+{
+  "id": "d7d71bcd-e1bf-5861-b8de-81cc658bdac7",
+  "revision": 1,
+  "last_node_id": 17,
+  "last_link_id": 21,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadVideo",
+      "pos": [
+        30,
+        0
+      ],
+      "size": [
+        430,
+        350
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "文件",
+          "name": "file",
+          "type": "COMBO",
+          "widget": {
+            "name": "file"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "视频",
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "slot_index": 0,
+          "links": [
+            1,
+            17
+          ]
+        }
+      ],
+      "title": "1. 完整原视频（20.5秒 / 484帧）",
+      "properties": {
+        "Node name for S&R": "LoadVideo"
+      },
+      "widgets_values": [
+        "three_person_face_swap_source.mp4"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "LoadImage",
+      "pos": [
+        40,
+        430
+      ],
+      "size": [
+        380,
+        430
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "图像",
+          "name": "image",
+          "type": "COMBO",
+          "widget": {
+            "name": "image"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "选择文件上传",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "图像",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            5,
+            8,
+            11
+          ]
+        },
+        {
+          "localized_name": "遮罩",
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "title": "2A. 图1：固定替换人物 A",
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "three_person_asset_A_red_official.png",
+        "image"
+      ]
+    },
+    {
+      "id": 3,
+      "type": "LoadImage",
+      "pos": [
+        40,
+        930
+      ],
+      "size": [
+        380,
+        430
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "图像",
+          "name": "image",
+          "type": "COMBO",
+          "widget": {
+            "name": "image"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "选择文件上传",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "图像",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            6,
+            9,
+            12
+          ]
+        },
+        {
+          "localized_name": "遮罩",
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "title": "2B. 图2：固定替换人物 B",
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "three_person_asset_B_green_official.png",
+        "image"
+      ]
+    },
+    {
+      "id": 4,
+      "type": "LoadImage",
+      "pos": [
+        40,
+        1430
+      ],
+      "size": [
+        380,
+        430
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "图像",
+          "name": "image",
+          "type": "COMBO",
+          "widget": {
+            "name": "image"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "选择文件上传",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "图像",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            7,
+            10,
+            13
+          ]
+        },
+        {
+          "localized_name": "遮罩",
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "title": "2C. 图3：固定替换人物 C",
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "three_person_asset_C_black_warrior.png",
+        "image"
+      ]
+    },
+    {
+      "id": 5,
+      "type": "CompanyWan27SplitThreeSegments",
+      "pos": [
+        620,
+        600
+      ],
+      "size": [
+        660,
+        560
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "完整原视频",
+          "name": "video",
+          "type": "VIDEO",
+          "link": 1
+        },
+        {
+          "localized_name": "三段帧范围 JSON",
+          "name": "segments_json",
+          "type": "STRING",
+          "widget": {
+            "name": "segments_json"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "强制重新切分",
+          "name": "force_resplit",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "force_resplit"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "第1段：0-195帧",
+          "name": "第1段：0-195帧",
+          "type": "VIDEO",
+          "slot_index": 0,
+          "links": [
+            2
+          ]
+        },
+        {
+          "localized_name": "第2段：196-373帧",
+          "name": "第2段：196-373帧",
+          "type": "VIDEO",
+          "slot_index": 1,
+          "links": [
+            3
+          ]
+        },
+        {
+          "localized_name": "第3段：374-483帧",
+          "name": "第3段：374-483帧",
+          "type": "VIDEO",
+          "slot_index": 2,
+          "links": [
+            4
+          ]
+        },
+        {
+          "localized_name": "切分报告 JSON",
+          "name": "切分报告 JSON",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "title": "3. 本地拆分：输出三个真实视频分支（不付费）",
+      "properties": {
+        "Node name for S&R": "CompanyWan27SplitThreeSegments"
+      },
+      "widgets_values": [
+        "[\n  {\n    \"start_frame\": 0,\n    \"end_frame\": 195\n  },\n  {\n    \"start_frame\": 196,\n    \"end_frame\": 373\n  },\n  {\n    \"start_frame\": 374,\n    \"end_frame\": 483\n  }\n]",
+        false
+      ],
+      "color": "#37474f",
+      "bgcolor": "#52656f"
+    },
+    {
+      "id": 6,
+      "type": "CompanyWan27ThreePersonVideoEdit",
+      "pos": [
+        1430,
+        -100
+      ],
+      "size": [
+        850,
+        850
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "原视频（2-10 秒）",
+          "name": "video",
+          "type": "VIDEO",
+          "link": 2
+        },
+        {
+          "localized_name": "图1：替换原视频人物 A",
+          "name": "image_a",
+          "type": "IMAGE",
+          "link": 5
+        },
+        {
+          "localized_name": "图2：替换原视频人物 B",
+          "name": "image_b",
+          "type": "IMAGE",
+          "link": 6
+        },
+        {
+          "localized_name": "图3：替换原视频人物 C",
+          "name": "image_c",
+          "type": "IMAGE",
+          "link": 7
+        },
+        {
+          "localized_name": "人物替换指令",
+          "name": "prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "prompt"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "模型",
+          "name": "model",
+          "type": "COMBO",
+          "widget": {
+            "name": "model"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "分辨率",
+          "name": "resolution",
+          "type": "COMBO",
+          "widget": {
+            "name": "resolution"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "截断时长（0=原视频）",
+          "name": "duration",
+          "type": "INT",
+          "widget": {
+            "name": "duration"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "声音",
+          "name": "audio_setting",
+          "type": "COMBO",
+          "widget": {
+            "name": "audio_setting"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "智能改写",
+          "name": "prompt_extend",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "prompt_extend"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "水印",
+          "name": "watermark",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "watermark"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "种子",
+          "name": "seed",
+          "type": "INT",
+          "widget": {
+            "name": "seed"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "负面提示词",
+          "name": "negative_prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "negative_prompt"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "视频",
+          "name": "视频",
+          "type": "VIDEO",
+          "slot_index": 0,
+          "links": [
+            14,
+            18
+          ]
+        },
+        {
+          "localized_name": "视频路径",
+          "name": "视频路径",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "title": "4A. 第1段 Wan 2.7 生成（0-195帧 / 约8.32秒）",
+      "properties": {
+        "Node name for S&R": "CompanyWan27ThreePersonVideoEdit"
+      },
+      "widgets_values": [
+        "严格保留原视频的时序、人物动作、表演、镜头运动、构图、景别、场景、光线和剪辑节奏，只替换三名指定人物的身份与外观。\n\n人物映射必须全程固定：将原视频中车旁左侧人物A替换为图1人物；将原视频中车旁右侧人物B替换为图2人物；将原视频中灰西装单人C替换为图3人物。图1、图2、图3仅作为对应人物的脸型、五官、发型、年龄感、体型、服装和配饰参考。\n\n三个人物从头到尾不得串脸、身份互换、面部融合、复制或消失。保持原视频人物的身体位置、朝向、动作幅度、遮挡关系和口型时序；保持原视频背景及所有非人物元素不变。人物必须自然融入原视频光照、阴影、透视和运动模糊。\n\n禁止新增人物，禁止改变剧情，禁止改变镜头，禁止改变场景，禁止字幕、文字、Logo、水印、肢体畸形、额外手指、脸部闪烁、服装跳变或背景跳变。\n\n这是完整视频第 1/3 段（0-195 帧）。 人物 A/B/C 映射必须与另外两段完全一致。",
+        "wan2.7-videoedit",
+        "720P",
+        0,
+        "origin",
+        true,
+        false,
+        0,
+        "身份互换，串脸，面部融合，人物复制，人物消失，肢体畸形，额外手指，字幕，文字，Logo，水印"
+      ],
+      "color": "#35534a",
+      "bgcolor": "#446b5f"
+    },
+    {
+      "id": 7,
+      "type": "CompanyWan27ThreePersonVideoEdit",
+      "pos": [
+        1430,
+        900
+      ],
+      "size": [
+        850,
+        850
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "原视频（2-10 秒）",
+          "name": "video",
+          "type": "VIDEO",
+          "link": 3
+        },
+        {
+          "localized_name": "图1：替换原视频人物 A",
+          "name": "image_a",
+          "type": "IMAGE",
+          "link": 8
+        },
+        {
+          "localized_name": "图2：替换原视频人物 B",
+          "name": "image_b",
+          "type": "IMAGE",
+          "link": 9
+        },
+        {
+          "localized_name": "图3：替换原视频人物 C",
+          "name": "image_c",
+          "type": "IMAGE",
+          "link": 10
+        },
+        {
+          "localized_name": "人物替换指令",
+          "name": "prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "prompt"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "模型",
+          "name": "model",
+          "type": "COMBO",
+          "widget": {
+            "name": "model"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "分辨率",
+          "name": "resolution",
+          "type": "COMBO",
+          "widget": {
+            "name": "resolution"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "截断时长（0=原视频）",
+          "name": "duration",
+          "type": "INT",
+          "widget": {
+            "name": "duration"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "声音",
+          "name": "audio_setting",
+          "type": "COMBO",
+          "widget": {
+            "name": "audio_setting"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "智能改写",
+          "name": "prompt_extend",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "prompt_extend"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "水印",
+          "name": "watermark",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "watermark"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "种子",
+          "name": "seed",
+          "type": "INT",
+          "widget": {
+            "name": "seed"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "负面提示词",
+          "name": "negative_prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "negative_prompt"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "视频",
+          "name": "视频",
+          "type": "VIDEO",
+          "slot_index": 0,
+          "links": [
+            15,
+            19
+          ]
+        },
+        {
+          "localized_name": "视频路径",
+          "name": "视频路径",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "title": "4B. 第2段 Wan 2.7 生成（196-373帧 / 约7.55秒）",
+      "properties": {
+        "Node name for S&R": "CompanyWan27ThreePersonVideoEdit"
+      },
+      "widgets_values": [
+        "严格保留原视频的时序、人物动作、表演、镜头运动、构图、景别、场景、光线和剪辑节奏，只替换三名指定人物的身份与外观。\n\n人物映射必须全程固定：将原视频中车旁左侧人物A替换为图1人物；将原视频中车旁右侧人物B替换为图2人物；将原视频中灰西装单人C替换为图3人物。图1、图2、图3仅作为对应人物的脸型、五官、发型、年龄感、体型、服装和配饰参考。\n\n三个人物从头到尾不得串脸、身份互换、面部融合、复制或消失。保持原视频人物的身体位置、朝向、动作幅度、遮挡关系和口型时序；保持原视频背景及所有非人物元素不变。人物必须自然融入原视频光照、阴影、透视和运动模糊。\n\n禁止新增人物，禁止改变剧情，禁止改变镜头，禁止改变场景，禁止字幕、文字、Logo、水印、肢体畸形、额外手指、脸部闪烁、服装跳变或背景跳变。\n\n这是完整视频第 2/3 段（196-373 帧）。 人物 A/B/C 映射必须与另外两段完全一致。",
+        "wan2.7-videoedit",
+        "720P",
+        0,
+        "origin",
+        true,
+        false,
+        0,
+        "身份互换，串脸，面部融合，人物复制，人物消失，肢体畸形，额外手指，字幕，文字，Logo，水印"
+      ],
+      "color": "#35534a",
+      "bgcolor": "#446b5f"
+    },
+    {
+      "id": 8,
+      "type": "CompanyWan27ThreePersonVideoEdit",
+      "pos": [
+        1430,
+        1900
+      ],
+      "size": [
+        850,
+        850
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "原视频（2-10 秒）",
+          "name": "video",
+          "type": "VIDEO",
+          "link": 4
+        },
+        {
+          "localized_name": "图1：替换原视频人物 A",
+          "name": "image_a",
+          "type": "IMAGE",
+          "link": 11
+        },
+        {
+          "localized_name": "图2：替换原视频人物 B",
+          "name": "image_b",
+          "type": "IMAGE",
+          "link": 12
+        },
+        {
+          "localized_name": "图3：替换原视频人物 C",
+          "name": "image_c",
+          "type": "IMAGE",
+          "link": 13
+        },
+        {
+          "localized_name": "人物替换指令",
+          "name": "prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "prompt"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "模型",
+          "name": "model",
+          "type": "COMBO",
+          "widget": {
+            "name": "model"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "分辨率",
+          "name": "resolution",
+          "type": "COMBO",
+          "widget": {
+            "name": "resolution"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "截断时长（0=原视频）",
+          "name": "duration",
+          "type": "INT",
+          "widget": {
+            "name": "duration"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "声音",
+          "name": "audio_setting",
+          "type": "COMBO",
+          "widget": {
+            "name": "audio_setting"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "智能改写",
+          "name": "prompt_extend",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "prompt_extend"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "水印",
+          "name": "watermark",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "watermark"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "种子",
+          "name": "seed",
+          "type": "INT",
+          "widget": {
+            "name": "seed"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "负面提示词",
+          "name": "negative_prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "negative_prompt"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "视频",
+          "name": "视频",
+          "type": "VIDEO",
+          "slot_index": 0,
+          "links": [
+            16,
+            20
+          ]
+        },
+        {
+          "localized_name": "视频路径",
+          "name": "视频路径",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "title": "4C. 第3段 Wan 2.7 生成（374-483帧 / 约4.67秒）",
+      "properties": {
+        "Node name for S&R": "CompanyWan27ThreePersonVideoEdit"
+      },
+      "widgets_values": [
+        "严格保留原视频的时序、人物动作、表演、镜头运动、构图、景别、场景、光线和剪辑节奏，只替换三名指定人物的身份与外观。\n\n人物映射必须全程固定：将原视频中车旁左侧人物A替换为图1人物；将原视频中车旁右侧人物B替换为图2人物；将原视频中灰西装单人C替换为图3人物。图1、图2、图3仅作为对应人物的脸型、五官、发型、年龄感、体型、服装和配饰参考。\n\n三个人物从头到尾不得串脸、身份互换、面部融合、复制或消失。保持原视频人物的身体位置、朝向、动作幅度、遮挡关系和口型时序；保持原视频背景及所有非人物元素不变。人物必须自然融入原视频光照、阴影、透视和运动模糊。\n\n禁止新增人物，禁止改变剧情，禁止改变镜头，禁止改变场景，禁止字幕、文字、Logo、水印、肢体畸形、额外手指、脸部闪烁、服装跳变或背景跳变。\n\n这是完整视频第 3/3 段（374-483 帧）。 人物 A/B/C 映射必须与另外两段完全一致。",
+        "wan2.7-videoedit",
+        "720P",
+        0,
+        "origin",
+        true,
+        false,
+        0,
+        "身份互换，串脸，面部融合，人物复制，人物消失，肢体畸形，额外手指，字幕，文字，Logo，水印"
+      ],
+      "color": "#35534a",
+      "bgcolor": "#446b5f"
+    },
+    {
+      "id": 9,
+      "type": "SaveVideo",
+      "pos": [
+        2380,
+        100
+      ],
+      "size": [
+        390,
+        480
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "视频",
+          "name": "video",
+          "type": "VIDEO",
+          "link": 14
+        },
+        {
+          "localized_name": "文件名前缀",
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "格式",
+          "name": "format",
+          "type": "COMBO",
+          "widget": {
+            "name": "format"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "编码器",
+          "name": "codec",
+          "type": "COMBO",
+          "widget": {
+            "name": "codec"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "video",
+          "name": "video",
+          "type": "VIDEO",
+          "links": null
+        }
+      ],
+      "title": "5A. 检查并保存第1段生成结果",
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "video/Wan27_full20s_segment_01",
+        "auto",
+        "auto"
+      ]
+    },
+    {
+      "id": 10,
+      "type": "SaveVideo",
+      "pos": [
+        2380,
+        1100
+      ],
+      "size": [
+        390,
+        480
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "视频",
+          "name": "video",
+          "type": "VIDEO",
+          "link": 15
+        },
+        {
+          "localized_name": "文件名前缀",
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "格式",
+          "name": "format",
+          "type": "COMBO",
+          "widget": {
+            "name": "format"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "编码器",
+          "name": "codec",
+          "type": "COMBO",
+          "widget": {
+            "name": "codec"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "video",
+          "name": "video",
+          "type": "VIDEO",
+          "links": null
+        }
+      ],
+      "title": "5B. 检查并保存第2段生成结果",
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "video/Wan27_full20s_segment_02",
+        "auto",
+        "auto"
+      ]
+    },
+    {
+      "id": 11,
+      "type": "SaveVideo",
+      "pos": [
+        2380,
+        2100
+      ],
+      "size": [
+        390,
+        480
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "视频",
+          "name": "video",
+          "type": "VIDEO",
+          "link": 16
+        },
+        {
+          "localized_name": "文件名前缀",
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "格式",
+          "name": "format",
+          "type": "COMBO",
+          "widget": {
+            "name": "format"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "编码器",
+          "name": "codec",
+          "type": "COMBO",
+          "widget": {
+            "name": "codec"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "video",
+          "name": "video",
+          "type": "VIDEO",
+          "links": null
+        }
+      ],
+      "title": "5C. 检查并保存第3段生成结果",
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "video/Wan27_full20s_segment_03",
+        "auto",
+        "auto"
+      ]
+    },
+    {
+      "id": 12,
+      "type": "CompanyWan27MergeThreeSegments",
+      "pos": [
+        2980,
+        850
+      ],
+      "size": [
+        790,
+        720
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "完整原视频（用于帧率和音频）",
+          "name": "original_video",
+          "type": "VIDEO",
+          "link": 17
+        },
+        {
+          "localized_name": "第1段 Wan 结果",
+          "name": "segment_1",
+          "type": "VIDEO",
+          "link": 18
+        },
+        {
+          "localized_name": "第2段 Wan 结果",
+          "name": "segment_2",
+          "type": "VIDEO",
+          "link": 19
+        },
+        {
+          "localized_name": "第3段 Wan 结果",
+          "name": "segment_3",
+          "type": "VIDEO",
+          "link": 20
+        },
+        {
+          "localized_name": "三段帧范围 JSON",
+          "name": "segments_json",
+          "type": "STRING",
+          "widget": {
+            "name": "segments_json"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "强制重新合并",
+          "name": "force_remerge",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "force_remerge"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "完整合并视频",
+          "name": "完整合并视频",
+          "type": "VIDEO",
+          "slot_index": 0,
+          "links": [
+            21
+          ]
+        },
+        {
+          "localized_name": "完整视频路径",
+          "name": "完整视频路径",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "localized_name": "合并报告 JSON",
+          "name": "合并报告 JSON",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "title": "6. 三段按原帧数合并 + 恢复完整原音频",
+      "properties": {
+        "Node name for S&R": "CompanyWan27MergeThreeSegments"
+      },
+      "widgets_values": [
+        "[\n  {\n    \"start_frame\": 0,\n    \"end_frame\": 195\n  },\n  {\n    \"start_frame\": 196,\n    \"end_frame\": 373\n  },\n  {\n    \"start_frame\": 374,\n    \"end_frame\": 483\n  }\n]",
+        false
+      ],
+      "color": "#5b4732",
+      "bgcolor": "#806348"
+    },
+    {
+      "id": 13,
+      "type": "SaveVideo",
+      "pos": [
+        3980,
+        970
+      ],
+      "size": [
+        390,
+        480
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "视频",
+          "name": "video",
+          "type": "VIDEO",
+          "link": 21
+        },
+        {
+          "localized_name": "文件名前缀",
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "格式",
+          "name": "format",
+          "type": "COMBO",
+          "widget": {
+            "name": "format"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "编码器",
+          "name": "codec",
+          "type": "COMBO",
+          "widget": {
+            "name": "codec"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "video",
+          "name": "video",
+          "type": "VIDEO",
+          "links": null
+        }
+      ],
+      "title": "7. 保存最终 20.5 秒 / 484帧结果",
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "video/Wan27_videoedit_three_people_full_20s",
+        "auto",
+        "auto"
+      ]
+    },
+    {
+      "id": 14,
+      "type": "MarkdownNote",
+      "pos": [
+        0,
+        -980
+      ],
+      "size": [
+        1050,
+        720
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "工作流总览｜Wan2.7 三人物直传的三段完整处理",
+      "properties": {},
+      "widgets_values": [
+        "# 工作流用途\n\n将约 20.5 秒、484 帧的三人物样片切成三个符合 Wan2.7 时长限制的真实视频片段，分别完成三人物替换，再按原帧数合并并恢复完整原音频。\n\n## 整体思路\n\n`完整视频 + A/B/C 三张参考图 → 本地切三段 → 三个独立 Wan2.7 付费任务 → 保存每段中间结果 → 规范化帧数并合并 → 恢复原音频 → 保存最终视频`\n\n本流程直接传递视频和参考图，不走 TOS/火山资产 ID 注册链。"
+      ],
+      "color": "#30485f",
+      "bgcolor": "#3f607d"
+    },
+    {
+      "id": 15,
+      "type": "MarkdownNote",
+      "pos": [
+        1150,
+        -980
+      ],
+      "size": [
+        1100,
+        720
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "节点作用｜输入素材与本地切分",
+      "properties": {},
+      "widgets_values": [
+        "# 节点 1–5\n\n1. **完整原视频**：同时提供给本地切分和最终合并，用于恢复原帧率与音频。\n2/3/4. **人物 A/B/C 参考图**：三张图按固定身份顺序同时连接到三个生成分支，不能交换。\n5. **本地拆分**：按帧范围输出三段真实视频，不调用远端服务、不产生模型费用。\n\n## 重要限制\n\n当前节点 5 和节点 12 都保存了专用于 484 帧样片的范围：`0–195 / 196–373 / 374–483`。更换源视频时必须同时重新设计并填写这两个节点的 `segments_json`，否则会截错或合并错。"
+      ],
+      "color": "#4b416d",
+      "bgcolor": "#62568b"
+    },
+    {
+      "id": 16,
+      "type": "MarkdownNote",
+      "pos": [
+        2350,
+        -980
+      ],
+      "size": [
+        1200,
+        720
+      ],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "节点作用｜三个独立 Wan2.7 付费分支",
+      "properties": {},
+      "widgets_values": [
+        "# 节点 6–11\n\n6/7/8. **第 1/2/3 段 Wan2.7 生成**：每个节点接收自己的视频片段和相同的 A/B/C 参考图，分别提交一个独立远端任务；三者都会产生费用。\n9/10/11. **中间结果保存**：分别保存三段生成视频，便于在最终合并前人工检查和单段重试。\n\n## 身份映射\n\n- A：车旁双人镜头画面左侧人物 → 图 1。\n- B：车旁双人镜头画面右侧人物 → 图 2。\n- C：灰西装单人镜头人物 → 图 3。\n\n三个提示词必须保持相同映射，避免跨段串脸。"
+      ],
+      "color": "#4b416d",
+      "bgcolor": "#62568b"
+    },
+    {
+      "id": 17,
+      "type": "MarkdownNote",
+      "pos": [
+        3650,
+        -980
+      ],
+      "size": [
+        1200,
+        720
+      ],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "执行、费用与验收｜最终输出会触发三个远端任务",
+      "properties": {},
+      "widgets_values": [
+        "# 节点 12–13\n\n12. **三段合并**：把三个 Wan 结果规范化到各自原帧数，按顺序拼成 484 帧，并从节点 1 恢复完整原音频。\n13. **最终保存**：输出完整结果。\n\n## 执行提醒\n\n运行最终节点会沿依赖链执行节点 6、7、8，即一次触发**三个独立付费任务**。建议先确认输入、帧范围、A/B/C 映射和预算。\n\n## 通过标准\n\n三段中人物身份不串换；切分接缝无明显重复/缺帧；最终结果为 484 帧、时长和帧率符合原片，且包含完整原音频。"
+      ],
+      "color": "#6b4f31",
+      "bgcolor": "#876640"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      5,
+      0,
+      "VIDEO"
+    ],
+    [
+      2,
+      5,
+      0,
+      6,
+      0,
+      "VIDEO"
+    ],
+    [
+      3,
+      5,
+      1,
+      7,
+      0,
+      "VIDEO"
+    ],
+    [
+      4,
+      5,
+      2,
+      8,
+      0,
+      "VIDEO"
+    ],
+    [
+      5,
+      2,
+      0,
+      6,
+      1,
+      "IMAGE"
+    ],
+    [
+      6,
+      3,
+      0,
+      6,
+      2,
+      "IMAGE"
+    ],
+    [
+      7,
+      4,
+      0,
+      6,
+      3,
+      "IMAGE"
+    ],
+    [
+      8,
+      2,
+      0,
+      7,
+      1,
+      "IMAGE"
+    ],
+    [
+      9,
+      3,
+      0,
+      7,
+      2,
+      "IMAGE"
+    ],
+    [
+      10,
+      4,
+      0,
+      7,
+      3,
+      "IMAGE"
+    ],
+    [
+      11,
+      2,
+      0,
+      8,
+      1,
+      "IMAGE"
+    ],
+    [
+      12,
+      3,
+      0,
+      8,
+      2,
+      "IMAGE"
+    ],
+    [
+      13,
+      4,
+      0,
+      8,
+      3,
+      "IMAGE"
+    ],
+    [
+      14,
+      6,
+      0,
+      9,
+      0,
+      "VIDEO"
+    ],
+    [
+      15,
+      7,
+      0,
+      10,
+      0,
+      "VIDEO"
+    ],
+    [
+      16,
+      8,
+      0,
+      11,
+      0,
+      "VIDEO"
+    ],
+    [
+      17,
+      1,
+      0,
+      12,
+      0,
+      "VIDEO"
+    ],
+    [
+      18,
+      6,
+      0,
+      12,
+      1,
+      "VIDEO"
+    ],
+    [
+      19,
+      7,
+      0,
+      12,
+      2,
+      "VIDEO"
+    ],
+    [
+      20,
+      8,
+      0,
+      12,
+      3,
+      "VIDEO"
+    ],
+    [
+      21,
+      12,
+      0,
+      13,
+      0,
+      "VIDEO"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "A. 完整原视频 + 三张固定人物参考图",
+      "bounding": [
+        -10,
+        -60,
+        500,
+        1980
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "B. 本地切分：0-195 / 196-373 / 374-483 帧",
+      "bounding": [
+        550,
+        500,
+        800,
+        800
+      ],
+      "color": "#5d7280",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "C1. 第1段：独立付费生成 + 中间结果",
+      "bounding": [
+        1360,
+        -180,
+        1470,
+        980
+      ],
+      "color": "#4f7f69",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 4,
+      "title": "C2. 第2段：独立付费生成 + 中间结果",
+      "bounding": [
+        1360,
+        820,
+        1470,
+        980
+      ],
+      "color": "#4f7f69",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 5,
+      "title": "C3. 第3段：独立付费生成 + 中间结果",
+      "bounding": [
+        1360,
+        1820,
+        1470,
+        980
+      ],
+      "color": "#4f7f69",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 6,
+      "title": "D. 精确合并 484 帧 + 恢复原音频 + 最终保存",
+      "bounding": [
+        2900,
+        760,
+        1570,
+        1100
+      ],
+      "color": "#8f6f4e",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "workflow_note": "可视化完整 20.5 秒版本：本地拆分节点明确输出三个合法 Wan2.7 输入；三个独立生成节点分别提交付费任务，并各自保存中间结果；最后统一规范化到原帧数、合并为 484 帧并恢复原音频。",
+    "ds": {
+      "scale": 0.28,
+      "offset": [
+        80,
+        70
+      ]
+    },
+    "frontendVersion": "1.45.20",
+    "company_remote_handover_notes": {
+      "version": 1,
+      "language": "zh-CN",
+      "node_type": "MarkdownNote",
+      "execution_impact": false
+    }
+  },
+  "version": 0.4
+}
