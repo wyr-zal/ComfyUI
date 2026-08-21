@@ -69,11 +69,13 @@ AUTO_ASSET_LIBRARY_VERSION = 1
 AUTO_ASSET_DIFFERENT_THRESHOLD = 0.75
 AUTO_ASSET_MAX_SOURCE_OBSERVATIONS = 6
 AUTO_ASSET_QUALITY_GATE_VERSION = "replacement-quality-v2"
+AUTO_ASSET_PERSON_MASTER_QUALITY_GATE_VERSION = "person-master-quality-v1"
 AUTO_ASSET_TARGET_STYLE_THRESHOLD = 0.85
 AUTO_ASSET_SOURCE_RESIDUE_THRESHOLD = 0.15
 AUTO_ASSET_COMPOSITION_THRESHOLD = 0.80
 AUTO_ASSET_PERSON_IDENTITY_THRESHOLD = 0.85
 AUTO_ASSET_SCENE_REPLACEMENT_THRESHOLD = 0.75
+AUTO_ASSET_BACKGROUND_PRESERVATION_THRESHOLD = 0.80
 AUTO_ASSET_MIN_PERSON_MASTER_EDGE = 96
 AUTO_ASSET_MIN_PERSON_MASTER_AREA = 12_000
 AUTO_ASSET_MIN_NEW_PERSON_CONFIDENCE = 0.80
@@ -83,6 +85,8 @@ AUTO_ASSET_STYLE_PHOTOREAL = "photoreal"
 AUTO_ASSET_STYLE_CG_3D = "cg_3d"
 AUTO_ASSET_STYLE_COMIC = "comic_illustration"
 AUTO_ASSET_STYLE_CUSTOM = "custom"
+RESTYLE_SCOPE_FULL_FRAME = "full_frame"
+RESTYLE_SCOPE_PERSON_ONLY = "person_only"
 AUTO_ASSET_PROGRESS_EVENT = "company_remote.auto_asset_progress"
 V3_PROCESSING_CONTRACT_VERSION = 3
 V3_GROUPING_VERSION = "adjacent-short-shots-v1"
@@ -3421,6 +3425,17 @@ def _normalize_auto_asset_style(value: Any) -> str:
     return normalized if normalized in supported else AUTO_ASSET_STYLE_WESTERN
 
 
+def _normalize_restyle_scope(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    return RESTYLE_SCOPE_PERSON_ONLY if normalized == RESTYLE_SCOPE_PERSON_ONLY else RESTYLE_SCOPE_FULL_FRAME
+
+
+def _restyle_scope_from_options(options: Any) -> str:
+    if not isinstance(options, dict):
+        return RESTYLE_SCOPE_FULL_FRAME
+    return _normalize_restyle_scope(options.get("restyle_scope"))
+
+
 def _person_asset_prompt(
     person: dict[str, Any],
     *,
@@ -3557,6 +3572,7 @@ def _integrated_frame_prompt(
     visual_style: str,
     style_prompt: str,
     retry_reasons: list[str] | None = None,
+    restyle_scope: str = RESTYLE_SCOPE_FULL_FRAME,
 ) -> str:
     style = _normalize_auto_asset_style(visual_style)
     style_targets = {
@@ -3569,7 +3585,65 @@ def _integrated_frame_prompt(
             "彻底、明显的欧美化影视视觉：人物整体造型、服装、发型与气质，以及建筑、材质、陈设和地域语言"
         ),
     }
-    references: list[str] = [
+    position = "开始" if role == "frame_start" else "结束"
+    people = "；".join(str(item.get("appearance") or "主要人物") for item in analysis.get("people", []))
+    background = analysis.get("background") if isinstance(analysis.get("background"), dict) else {}
+    scene_description = background.get("first_description") if role == "frame_start" else background.get("last_description")
+    failure_instruction = ""
+    if retry_reasons:
+        failure_instruction = (
+            "上一版因以下问题未通过验收，本次必须逐项修正："
+            + "；".join(str(item) for item in retry_reasons if str(item).strip())
+            + "。"
+        )
+    if _normalize_restyle_scope(restyle_scope) == RESTYLE_SCOPE_PERSON_ONLY:
+        person_style_targets = {
+            AUTO_ASSET_STYLE_ANIME: "高质量二维动漫角色造型、清晰线稿、赛璐璐上色和动漫光影",
+            AUTO_ASSET_STYLE_PHOTOREAL: "高质量真人影视角色质感、真实皮肤材质和自然光影",
+            AUTO_ASSET_STYLE_CG_3D: "高质量 3D 游戏 CG 角色造型、PBR 材质和影视级渲染",
+            AUTO_ASSET_STYLE_COMIC: "高质量漫画插画角色造型、手绘墨线和插画上色",
+            AUTO_ASSET_STYLE_CUSTOM: str(style_prompt or "用户指定的目标视觉风格").strip(),
+            AUTO_ASSET_STYLE_WESTERN: (
+                "彻底、明显的欧美化人物：整体面孔、发型发色、妆容、服装鞋履、配饰和气质均为当代欧美设计"
+            ),
+        }
+        references = [
+            "图片 1 是当前镜头原始整帧，它同时提供两部分内容："
+            "背景、环境、光影、色调、构图、机位、景别、动作、人物数量、空间关系和叙事物体位置必须原样保留；"
+            "画面中的人物是唯一需要替换的对象"
+        ]
+        next_index = 2
+        if person_master_count:
+            end = next_index + person_master_count - 1
+            references.append(
+                f"图片 {next_index}" + (f" 至图片 {end}" if end > next_index else "") +
+                " 是人物替换母版，只负责替换后人物的身份、脸、发型、服装、配饰和整体造型"
+            )
+            next_index = end + 1
+        if has_style_master:
+            references.append(
+                f"图片 {next_index} 是人物风格参考，只迁移人物的风格强度，严禁影响背景或复制其构图"
+            )
+        no_master_note = (
+            "本镜头没有人物母版，画面中的人物按目标人物风格整体重绘，但身份特征、体型、动作保持原人物。"
+            if not person_master_count
+            else ""
+        )
+        return (
+            "执行仅人物替换的整帧编辑。" + "；".join(references) + "。"
+            f"输出必须保持图片 1 的完整画幅、{position}帧构图、透视、景别、人物数量、人物站位、动作状态和叙事物体，"
+            "并且背景、环境、建筑、家具、道具、天空、地面、光线方向、色调和摄影质感必须与图片 1 保持一致，"
+            "不得风格化背景、不得重绘环境、不得改变背景中的任何物体、文字或光影。"
+            f"只把画面中的人物替换为目标人物：{person_style_targets[style]}。"
+            "替换后的人物必须与图片 1 的原背景自然融合：透视、比例、接触阴影、光照方向与色温都要匹配原背景。"
+            "不得只做调色或只换脸；人物与图片 1 明显不同是预期结果，但背景与图片 1 不同是错误结果；"
+            "不得新增、删除、复制、融合人物，不得把母版中的背景或构图搬到当前镜头。"
+            f"{no_master_note}"
+            f"当前人物：{people or '按原整帧中的实际人物数量与外观处理'}。"
+            f"当前场景（必须保持原样）：{str(scene_description or '保持图片 1 的原始背景')}。"
+            f"{failure_instruction}只输出一张完成后的整帧画面，不要文字、水印、边框或说明。"
+        )
+    references = [
         "图片 1 是当前镜头原始整帧，只负责构图、机位、景别、动作、人物数量、空间关系和叙事物体位置，"
         "不提供人物身份、服装、建筑、地域、材质或视觉风格约束"
     ]
@@ -3588,17 +3662,6 @@ def _integrated_frame_prompt(
         references.append(
             f"图片 {next_index} 是全局强风格母版，只迁移风格强度和视觉语言，严禁复制其中的人物、建筑布局或构图"
         )
-    failure_instruction = ""
-    if retry_reasons:
-        failure_instruction = (
-            "上一版因以下问题未通过验收，本次必须逐项修正："
-            + "；".join(str(item) for item in retry_reasons if str(item).strip())
-            + "。"
-        )
-    position = "开始" if role == "frame_start" else "结束"
-    people = "；".join(str(item.get("appearance") or "主要人物") for item in analysis.get("people", []))
-    background = analysis.get("background") if isinstance(analysis.get("background"), dict) else {}
-    scene_description = background.get("first_description") if role == "frame_start" else background.get("last_description")
     return (
         "执行多图整帧替换。" + "；".join(references) + "。"
         f"输出必须保持图片 1 的完整画幅、{position}帧构图、透视、景别、人物数量、人物站位、动作状态和叙事物体，"
@@ -3623,39 +3686,51 @@ def _normalize_integrated_frame_quality(
     value: Any,
     *,
     require_person_identity: bool,
+    restyle_scope: str = RESTYLE_SCOPE_FULL_FRAME,
 ) -> dict[str, Any]:
     result = value if isinstance(value, dict) else {}
+    person_only = _normalize_restyle_scope(restyle_scope) == RESTYLE_SCOPE_PERSON_ONLY
     target_style = _score01(result.get("target_style_score"))
     source_residue = _score01(result.get("source_style_residue"))
     composition = _score01(result.get("composition_preservation"))
     person_identity = _score01(result.get("person_identity_score")) if require_person_identity else 1.0
-    scene_replacement = _score01(result.get("scene_replacement_score", result.get("scene_identity_score")))
     person_count_match = bool(result.get("person_count_match"))
     reasons = _as_string_list(result.get("reasons"))
     failed: list[str] = []
     if target_style < AUTO_ASSET_TARGET_STYLE_THRESHOLD:
-        failed.append(f"目标风格强度不足（{target_style:.2f}）")
+        failed.append(
+            f"人物目标风格强度不足（{target_style:.2f}）" if person_only else f"目标风格强度不足（{target_style:.2f}）"
+        )
     if source_residue > AUTO_ASSET_SOURCE_RESIDUE_THRESHOLD:
-        failed.append(f"原风格残留过多（{source_residue:.2f}）")
+        failed.append(
+            f"人物原样残留过多（{source_residue:.2f}）" if person_only else f"原风格残留过多（{source_residue:.2f}）"
+        )
     if composition < AUTO_ASSET_COMPOSITION_THRESHOLD:
         failed.append(f"构图保留不足（{composition:.2f}）")
     if not person_count_match:
         failed.append("人物数量与源帧不一致")
     if require_person_identity and person_identity < AUTO_ASSET_PERSON_IDENTITY_THRESHOLD:
         failed.append(f"人物身份一致性不足（{person_identity:.2f}）")
-    if scene_replacement < AUTO_ASSET_SCENE_REPLACEMENT_THRESHOLD:
-        failed.append(f"场景替换或空间关系不合格（{scene_replacement:.2f}）")
+    if person_only:
+        background_preservation = _score01(
+            result.get("background_preservation_score", result.get("scene_replacement_score"))
+        )
+        if background_preservation < AUTO_ASSET_BACKGROUND_PRESERVATION_THRESHOLD:
+            failed.append(f"原背景保留不足（{background_preservation:.2f}）")
+    else:
+        scene_replacement = _score01(result.get("scene_replacement_score", result.get("scene_identity_score")))
+        if scene_replacement < AUTO_ASSET_SCENE_REPLACEMENT_THRESHOLD:
+            failed.append(f"场景替换或空间关系不合格（{scene_replacement:.2f}）")
     for item in failed:
         if item not in reasons:
             reasons.append(item)
-    return {
+    normalized = {
         "version": AUTO_ASSET_QUALITY_GATE_VERSION,
         "target_style_score": target_style,
         "source_style_residue": source_residue,
         "composition_preservation": composition,
         "person_count_match": person_count_match,
         "person_identity_score": person_identity,
-        "scene_replacement_score": scene_replacement,
         "verdict": "approved" if not failed else "retry",
         "reasons": reasons,
         "thresholds": {
@@ -3663,9 +3738,16 @@ def _normalize_integrated_frame_quality(
             "source_style_residue": AUTO_ASSET_SOURCE_RESIDUE_THRESHOLD,
             "composition_preservation": AUTO_ASSET_COMPOSITION_THRESHOLD,
             "person_identity_score": AUTO_ASSET_PERSON_IDENTITY_THRESHOLD,
-            "scene_replacement_score": AUTO_ASSET_SCENE_REPLACEMENT_THRESHOLD,
         },
     }
+    if person_only:
+        normalized["restyle_scope"] = RESTYLE_SCOPE_PERSON_ONLY
+        normalized["background_preservation_score"] = background_preservation
+        normalized["thresholds"]["background_preservation_score"] = AUTO_ASSET_BACKGROUND_PRESERVATION_THRESHOLD
+    else:
+        normalized["scene_replacement_score"] = scene_replacement
+        normalized["thresholds"]["scene_replacement_score"] = AUTO_ASSET_SCENE_REPLACEMENT_THRESHOLD
+    return normalized
 
 
 def _evaluate_integrated_frame_quality(
@@ -3679,7 +3761,9 @@ def _evaluate_integrated_frame_quality(
     model: str,
     visual_style: str,
     style_prompt: str,
+    restyle_scope: str = RESTYLE_SCOPE_FULL_FRAME,
 ) -> dict[str, Any]:
+    person_only = _normalize_restyle_scope(restyle_scope) == RESTYLE_SCOPE_PERSON_ONLY
     images = [source_frame, candidate]
     labels = ["图片1=当前源整帧", "图片2=候选整帧替换结果"]
     for person in person_masters:
@@ -3691,23 +3775,46 @@ def _evaluate_integrated_frame_quality(
     if style_master is not None:
         images.append(style_master)
         labels.append(f"图片{len(images)}=全局强风格母版")
-    output_contract = (
-        '{"target_style_score":0-1,"source_style_residue":0-1,'
-        '"composition_preservation":0-1,"person_count_match":true|false,'
-        '"person_identity_score":0-1,"scene_replacement_score":0-1,"reasons":[]}'
-    )
-    request = (
-        f"输入顺序：{'；'.join(labels)}。"
-        "严格比较图片2是否保留图片1的构图、机位、景别、人物数量、动作、空间关系和叙事物体，"
-        "并是否用人物/场景替换母版完成明显的目标替换。不要因为人物长相、服装、建筑或环境与图片1不同而扣分，"
-        "这种改变正是目标。若仍接近源图、只调色、人物数量变化、身份未遵循人物母版、环境未遵循场景母版、"
-        "空间关系丢失或复制了母版构图，必须降低对应分数。"
-        f"目标风格类型：{_normalize_auto_asset_style(visual_style)}；目标说明：{str(style_prompt or '')[:1200]}。"
-        f"镜头分析：{json.dumps(analysis, ensure_ascii=False)[:1800]}。只输出合法 JSON：{output_contract}。"
-    )
+    if person_only:
+        output_contract = (
+            '{"target_style_score":0-1,"source_style_residue":0-1,'
+            '"composition_preservation":0-1,"person_count_match":true|false,'
+            '"person_identity_score":0-1,"background_preservation_score":0-1,"reasons":[]}'
+        )
+        request = (
+            f"输入顺序：{'；'.join(labels)}。"
+            "这是仅人物替换任务：图片2 必须保留图片1 的背景、环境、光影、色调、构图、机位、景别、"
+            "人物数量、动作、空间关系和叙事物体，只有人物被替换为目标风格。"
+            "background_preservation_score 衡量图片2 的背景与图片1 是否一致：背景被重绘、风格化、"
+            "改变物体、改变光线或明显调色时必须降低该分数。"
+            "target_style_score 衡量人物是否被明显替换为目标风格；source_style_residue 衡量人物区域是否残留原样"
+            "（背景保持原样不算残留，不得因此扣分）。若人物身份未遵循人物母版、人物数量变化、只调色或只换脸，"
+            "必须降低对应分数。"
+            f"目标人物风格类型：{_normalize_auto_asset_style(visual_style)}；目标说明：{str(style_prompt or '')[:1200]}。"
+            f"镜头分析：{json.dumps(analysis, ensure_ascii=False)[:1800]}。只输出合法 JSON：{output_contract}。"
+        )
+        skill = (
+            "你是严格的仅人物替换验收器。宁可要求再次生成，也不能让背景被改动、弱替换或身份错误的整帧进入视频参考包。"
+        )
+    else:
+        output_contract = (
+            '{"target_style_score":0-1,"source_style_residue":0-1,'
+            '"composition_preservation":0-1,"person_count_match":true|false,'
+            '"person_identity_score":0-1,"scene_replacement_score":0-1,"reasons":[]}'
+        )
+        request = (
+            f"输入顺序：{'；'.join(labels)}。"
+            "严格比较图片2是否保留图片1的构图、机位、景别、人物数量、动作、空间关系和叙事物体，"
+            "并是否用人物/场景替换母版完成明显的目标替换。不要因为人物长相、服装、建筑或环境与图片1不同而扣分，"
+            "这种改变正是目标。若仍接近源图、只调色、人物数量变化、身份未遵循人物母版、环境未遵循场景母版、"
+            "空间关系丢失或复制了母版构图，必须降低对应分数。"
+            f"目标风格类型：{_normalize_auto_asset_style(visual_style)}；目标说明：{str(style_prompt or '')[:1200]}。"
+            f"镜头分析：{json.dumps(analysis, ensure_ascii=False)[:1800]}。只输出合法 JSON：{output_contract}。"
+        )
+        skill = "你是严格的整帧替换验收器。宁可要求再次生成，也不能让弱替换、身份错误或空间关系错误进入视频参考包。"
     raw = generate_openai_image_prompt_text(
         _get_config("gpttext"),
-        skill="你是严格的整帧替换验收器。宁可要求再次生成，也不能让弱替换、身份错误或空间关系错误进入视频参考包。",
+        skill=skill,
         modification_target=request,
         image=_vision_batch(images),
         model=model,
@@ -3717,6 +3824,7 @@ def _evaluate_integrated_frame_quality(
     return _normalize_integrated_frame_quality(
         _extract_json_object(raw),
         require_person_identity=bool(person_masters),
+        restyle_scope=restyle_scope,
     )
 
 
@@ -3970,6 +4078,92 @@ def _vision_batch(items: list[Any], *, size: int = 512) -> torch.Tensor:
     return torch.stack(prepared, dim=0)
 
 
+def _normalize_person_master_quality(value: Any, *, visual_style: str) -> dict[str, Any]:
+    result = value if isinstance(value, dict) else {}
+    style = _normalize_auto_asset_style(visual_style)
+    target_style = _score01(result.get("target_style_score"))
+    source_residue = _score01(result.get("source_style_residue"))
+    subject_contract = _score01(result.get("subject_contract_score"))
+    subject_count_match = bool(result.get("subject_count_match"))
+    subject_kind = str(result.get("subject_kind") or "human").strip().lower()
+    if subject_kind not in {"human", "animal", "other"}:
+        subject_kind = "human"
+    reasons = _as_string_list(result.get("reasons"))
+    failed: list[str] = []
+    if subject_kind == "human" and target_style < AUTO_ASSET_TARGET_STYLE_THRESHOLD:
+        failed.append(f"人物母版目标风格强度不足（{target_style:.2f}）")
+    if subject_kind == "human" and style != AUTO_ASSET_STYLE_PHOTOREAL and source_residue > AUTO_ASSET_SOURCE_RESIDUE_THRESHOLD:
+        failed.append(f"人物母版原样残留过多（{source_residue:.2f}）")
+    if subject_contract < AUTO_ASSET_PERSON_IDENTITY_THRESHOLD:
+        failed.append(f"人物母版主体契约保持不足（{subject_contract:.2f}）")
+    if not subject_count_match:
+        failed.append("人物母版主体数量与源观察不一致")
+    for item in failed:
+        if item not in reasons:
+            reasons.append(item)
+    return {
+        "version": AUTO_ASSET_PERSON_MASTER_QUALITY_GATE_VERSION,
+        "target_style_score": target_style,
+        "source_style_residue": source_residue,
+        "subject_contract_score": subject_contract,
+        "subject_count_match": subject_count_match,
+        "subject_kind": subject_kind,
+        "verdict": "approved" if not failed else "retry",
+        "reasons": reasons,
+        "thresholds": {
+            "target_style_score": AUTO_ASSET_TARGET_STYLE_THRESHOLD,
+            "source_style_residue": AUTO_ASSET_SOURCE_RESIDUE_THRESHOLD,
+            "subject_contract_score": AUTO_ASSET_PERSON_IDENTITY_THRESHOLD,
+        },
+    }
+
+
+def _evaluate_person_master_quality(
+    *,
+    source_images: list[Any],
+    candidate: Any,
+    person: dict[str, Any],
+    model: str,
+    visual_style: str,
+    style_prompt: str,
+) -> dict[str, Any]:
+    style = _normalize_auto_asset_style(visual_style)
+    source_count = len(source_images)
+    source_labels = "、".join(f"图片 {index}" for index in range(1, source_count + 1))
+    candidate_label = f"图片 {source_count + 1}"
+    target_description = {
+        AUTO_ASSET_STYLE_WESTERN: "一位符合当代欧美审美的外国人物，必须清除原始中式/东方服饰、发型和地域面孔残留",
+        AUTO_ASSET_STYLE_ANIME: "统一、高质量的二维动漫角色设定图",
+        AUTO_ASSET_STYLE_PHOTOREAL: "高质量真人影视角色参考图",
+        AUTO_ASSET_STYLE_CG_3D: "统一、高质量的 3D 游戏 CG 角色设定图",
+        AUTO_ASSET_STYLE_COMIC: "统一、高质量的漫画插画角色设定图",
+        AUTO_ASSET_STYLE_CUSTOM: str(style_prompt or "用户指定的目标视觉风格"),
+    }[style]
+    request = (
+        f"输入顺序：{source_labels} 是同一主体的原始观察图；{candidate_label} 是待入库的人物替换母版。"
+        f"严格验收 {candidate_label} 是否真正达到目标：{target_description}。"
+        "目标风格分 target_style_score 衡量人类主体是否完成明确、完整的目标风格转换；"
+        "原样残留分 source_style_residue 衡量人类主体中不符合目标的面孔地域特征、发型、服饰、材质或视觉媒介是否仍被直接保留。"
+        "subject_kind 必须是 human、animal 或 other：动物和非人主体不得被要求变成欧美人，但仍必须保持主体类别和外观一致。"
+        "主体契约分 subject_contract_score 衡量性别表达、年龄段、体型、主体类别、叙事身份功能是否保留；"
+        "不能把原人物轻微修饰后当成转换成功，也不能换成错误主体、多人、半身碎片或拼贴图。"
+        f"当前主体可见特征：{str(person.get('appearance') or '')[:1000]}。"
+        "只输出合法 JSON："
+        '{"target_style_score":0-1,"source_style_residue":0-1,"subject_contract_score":0-1,'
+        '"subject_count_match":true|false,"subject_kind":"human|animal|other","reasons":[]}。'
+    )
+    raw = generate_openai_image_prompt_text(
+        _get_config("gpttext"),
+        skill="你是严格的人物替换母版验收器。未经明确目标风格转换的原样人物绝不能进入可复用素材库。",
+        modification_target=request,
+        image=_vision_batch([*source_images, candidate]),
+        model=model,
+        temperature=0.0,
+        max_tokens=500,
+    )
+    return _normalize_person_master_quality(_extract_json_object(raw), visual_style=style)
+
+
 def _reference_images_for_task(
     adapter: VideoEngineAdapter,
     *,
@@ -4076,6 +4270,7 @@ def _build_auto_asset_video_prompt(
     visual_style: str = AUTO_ASSET_STYLE_WESTERN,
     send_source_video: bool = True,
     reference_timeline: list[dict[str, Any]] | None = None,
+    restyle_scope: str = RESTYLE_SCOPE_FULL_FRAME,
 ) -> str:
     continuity = (
         "上一段末帧是动作与空间连续性的软参考；优先保持本段剧情和镜头逻辑。"
@@ -4084,7 +4279,33 @@ def _build_auto_asset_video_prompt(
     )
     people = "; ".join(item.get("appearance", "主要人物") for item in analysis.get("people", [])) or "按原视频实际人物处理"
     style = _normalize_auto_asset_style(visual_style)
-    if style == AUTO_ASSET_STYLE_ANIME:
+    person_only = _normalize_restyle_scope(restyle_scope) == RESTYLE_SCOPE_PERSON_ONLY
+    if person_only:
+        person_style_names = {
+            AUTO_ASSET_STYLE_ANIME: "高质量二维动漫角色",
+            AUTO_ASSET_STYLE_PHOTOREAL: "高质量真人影视角色",
+            AUTO_ASSET_STYLE_CG_3D: "高质量 3D 游戏 CG 角色",
+            AUTO_ASSET_STYLE_COMIC: "高质量漫画插画角色",
+            AUTO_ASSET_STYLE_CUSTOM: "用户指定目标风格的角色",
+            AUTO_ASSET_STYLE_WESTERN: "整体欧美化的外国人物",
+        }
+        source_instruction = (
+            "未向视频模型提供原分镜视频；整帧参考图给出了本段应有的画面基准，"
+            "只能依据整帧参考图和本段剧情分析文字重新演绎动作和镜头。"
+            if not send_source_video
+            else "原分镜视频定义剧情、动作、镜头、时间过程和背景画面本身。"
+        )
+        style_instruction = (
+            "这是仅人物替换任务，画面分两部分处理："
+            f"人物：整段视频中的人物必须是{person_style_names[style]}，严格遵循人物参考图的身份、脸、发型、"
+            "服装、配饰和整体造型，从第一帧到最后一帧保持稳定，不得恢复原人物，不得只换脸。"
+            "背景与环境：必须与整帧参考图中的背景完全一致，即原视频的真实背景；"
+            "禁止风格化背景、禁止重绘环境、禁止改变建筑、家具、道具、天空、地面、光线方向、色调和摄影质感，"
+            "背景中的物体位置与细节保持原样。整帧参考图展示了『人物已替换、背景保持原视频』的最终画面标准，"
+            "输出的每一帧都必须符合这一标准。替换后的人物必须与原背景自然融合：透视、比例、接触阴影、"
+            "光照方向与色温都要匹配背景。"
+        )
+    elif style == AUTO_ASSET_STYLE_ANIME:
         source_instruction = (
             "未向视频模型提供原真人分镜视频；只能依据本段剧情分析文字重新演绎动作和镜头。"
             if not send_source_video
@@ -4537,23 +4758,38 @@ def _auto_asset_task_complete(
     *,
     reuse_threshold: float,
     require_integrated_frames: bool = False,
+    restyle_scope: str = RESTYLE_SCOPE_FULL_FRAME,
 ) -> bool:
     if task.get("auto_asset_status") != "ready" or task.get("auto_asset_errors"):
         return False
-    if not _auto_asset_task_masters_complete(task, root, reuse_threshold=reuse_threshold):
+    if not _auto_asset_task_masters_complete(
+        task, root, reuse_threshold=reuse_threshold, restyle_scope=restyle_scope
+    ):
         return False
     if not require_integrated_frames:
         return True
     assets = task.get("auto_assets")
     integrated = _approved_integrated_frames(assets)
+    expected_frames = _auto_asset_expected_frame_roles(task, reuse_threshold=reuse_threshold)
+    return all(role in integrated for role in expected_frames)
+
+
+def _auto_asset_expected_frame_roles(task: dict[str, Any], *, reuse_threshold: float) -> list[str]:
     expected_scenes = _auto_asset_expected_scene_roles(task, reuse_threshold=reuse_threshold)
     expected_frames = ["frame_start"]
     if len(expected_scenes) > 1:
         expected_frames.append("frame_end")
-    return all(role in integrated for role in expected_frames)
+    return expected_frames
 
 
-def _auto_asset_expected_scene_roles(task: dict[str, Any], *, reuse_threshold: float) -> list[str]:
+def _auto_asset_expected_scene_roles(
+    task: dict[str, Any],
+    *,
+    reuse_threshold: float,
+    restyle_scope: str = RESTYLE_SCOPE_FULL_FRAME,
+) -> list[str]:
+    if _normalize_restyle_scope(restyle_scope) == RESTYLE_SCOPE_PERSON_ONLY:
+        return []
     analysis = task.get("auto_asset_analysis")
     assets = task.get("auto_assets")
     if not isinstance(analysis, dict):
@@ -4572,6 +4808,7 @@ def _auto_asset_task_masters_complete(
     root: Path,
     *,
     reuse_threshold: float,
+    restyle_scope: str = RESTYLE_SCOPE_FULL_FRAME,
 ) -> bool:
     analysis = task.get("auto_asset_analysis")
     assets = task.get("auto_assets")
@@ -4595,7 +4832,9 @@ def _auto_asset_task_masters_complete(
             and str(item.get("slot") or "") not in ignored_people
         )
     ]
-    expected_scenes = _auto_asset_expected_scene_roles(task, reuse_threshold=reuse_threshold)
+    expected_scenes = _auto_asset_expected_scene_roles(
+        task, reuse_threshold=reuse_threshold, restyle_scope=restyle_scope
+    )
     return all(slot in people for slot in expected_people) and all(role in scenes for role in expected_scenes)
 
 
@@ -4696,6 +4935,490 @@ def _public_auto_asset_progress_payload(payload: dict[str, Any]) -> dict[str, An
         return value
 
     return sanitize(payload)
+
+
+_AUTO_ASSET_FAILURE_CATEGORY_DETAILS = {
+    "auth_unavailable": (
+        "远端服务无可用认证",
+        "请检查对应网关的 OAuth/账号状态、模型权限和 API 配置，确认至少一个可用认证后重试。",
+    ),
+    "server_is_overloaded": (
+        "远端服务过载或暂时不可用",
+        "请等待服务恢复后重试；若持续出现，可降低图片并发数或切换可用模型。",
+    ),
+    "source_frames_failed": (
+        "源视频画面读取失败",
+        "请检查源视频文件是否完整、可读取，并确认 FFmpeg 能正常解码。",
+    ),
+    "analysis_failed": (
+        "人物与背景分析失败",
+        "请检查文本分析模型和网关状态后重试。",
+    ),
+    "generation_failed": (
+        "图片生成失败",
+        "请检查图片模型、网关状态和输入素材后重试。",
+    ),
+    "quality_gate_failed": (
+        "转绘质量门控未通过",
+        "请检查源素材和目标风格提示词，必要时人工审阅后重试失败镜头。",
+    ),
+    "tos_upload_failed": (
+        "人物素材上传失败",
+        "请检查 TOS 凭据、Bucket、Endpoint 和网络连接后重试。",
+    ),
+    "identity_review_required": (
+        "人物身份需要人工确认",
+        "请核对人物映射或补充清晰人物素材，再重试当前批次。",
+    ),
+    "identity_mapping_failed": (
+        "人物身份映射无效",
+        "请修正 identity_mapping_json 中的人物定义和镜头槽位映射。",
+    ),
+    "provider_policy": (
+        "远端内容策略阻止",
+        "请检查输入素材和提示词是否触发远端内容策略，再调整后重试。",
+    ),
+    "unknown": (
+        "自动参考素材准备失败",
+        "请查看代表性错误并检查对应镜头的自动资产状态。",
+    ),
+}
+_AUTO_ASSET_FAILURE_CATEGORY_ORDER = tuple(_AUTO_ASSET_FAILURE_CATEGORY_DETAILS)
+_FAILURE_DATA_URI_PATTERN = re.compile(r"(?i)data:[^;\s]+;base64,[a-z0-9+/=]+")
+_FAILURE_URL_PATTERN = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+_FAILURE_BEARER_PATTERN = re.compile(r"(?i)\bbearer\s+[a-z0-9._~+/=-]+")
+_FAILURE_SK_KEY_PATTERN = re.compile(r"(?i)\bsk-[a-z0-9_-]{6,}")
+_FAILURE_SECRET_FIELD_PATTERN = re.compile(
+    r"(?i)([\"']?(?:authorization|api[_-]?key|access[_-]?key|secret(?:[_-]?key)?|token|cookie)[\"']?\s*[:=]\s*[\"']?)([^\s,;}\"']+)"
+)
+
+
+def _sanitize_auto_asset_failure_text(value: Any, *, limit: int = 700) -> str:
+    """Return a short user-visible provider error without credentials or local paths."""
+    text = str(value or "").strip()
+    if not text:
+        return "未记录具体错误。"
+    text = _FAILURE_DATA_URI_PATTERN.sub("[图片数据]", text)
+    text = _FAILURE_BEARER_PATTERN.sub("Bearer ***", text)
+    text = _FAILURE_SK_KEY_PATTERN.sub("sk-***", text)
+    text = _FAILURE_SECRET_FIELD_PATTERN.sub(r"\1***", text)
+
+    def sanitize_url(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        trailing = ""
+        while raw and raw[-1] in '.,;，；)]}":':
+            trailing = raw[-1] + trailing
+            raw = raw[:-1]
+        try:
+            parsed = urllib.parse.urlsplit(raw)
+            safe = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+        except ValueError:
+            safe = "[URL]"
+        return safe + trailing
+
+    text = _FAILURE_URL_PATTERN.sub(sanitize_url, text)
+    text = _LOCAL_EVENT_PATH_PATTERN.sub("[本机路径]", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        text = text[: limit - 1].rstrip() + "…"
+    return text
+
+
+def _auto_asset_provider_error_details(value: Any) -> dict[str, Any]:
+    raw = str(value or "")
+    status_match = re.search(r"\bHTTP\s+(\d{3})\b", raw, re.IGNORECASE)
+    provider_code = ""
+    provider_message = ""
+    payload_start = raw.find("{")
+    if payload_start >= 0:
+        try:
+            payload = json.loads(raw[payload_start:])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            error = payload.get("error") if isinstance(payload.get("error"), dict) else payload
+            provider_code = str(error.get("code") or error.get("type") or "").strip()
+            provider_message = str(error.get("message") or "").strip()
+    if not provider_code:
+        code_match = re.search(
+            r"(?i)[\"']?(?:code|type)[\"']?\s*:\s*[\"']([^\"']+)[\"']",
+            raw,
+        )
+        if code_match:
+            provider_code = code_match.group(1).strip()
+    return {
+        "http_status": int(status_match.group(1)) if status_match else None,
+        "provider_code": _sanitize_auto_asset_failure_text(provider_code, limit=120) if provider_code else "",
+        "provider_message": (
+            _sanitize_auto_asset_failure_text(provider_message, limit=400) if provider_message else ""
+        ),
+    }
+
+
+def _classify_auto_asset_failure(status: str, error: dict[str, Any]) -> str:
+    error_kind = str(error.get("error_kind") or "").strip().lower()
+    kind = str(error.get("kind") or "").strip().lower()
+    text = f"{error_kind} {kind} {error.get('message') or ''}".lower()
+    if error_kind == "quality_gate_failed":
+        return "quality_gate_failed"
+    if error_kind == "tos_upload_failed":
+        return "tos_upload_failed"
+    if error_kind in {"identity_mapping_invalid", "identity_mapping_failed"} or status == "identity_mapping_failed":
+        return "identity_mapping_failed"
+    if error_kind in {"identity_review_required", "uncertain_candidate_found"} or status == "identity_review_required":
+        return "identity_review_required"
+    if error_kind in {"provider_policy", "blocked_by_provider_policy"} or _provider_policy_error(text):
+        return "provider_policy"
+    if any(marker in text for marker in (
+        "auth_unavailable",
+        "no auth available",
+        "authentication",
+        "unauthorized",
+        "forbidden",
+        "invalid api key",
+    )) or re.search(r"\bhttp\s+(?:401|403)\b", text):
+        return "auth_unavailable"
+    if any(marker in text for marker in (
+        "server_is_overloaded",
+        "servers are currently overloaded",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "too many requests",
+        "rate limit",
+    )) or re.search(r"\bhttp\s+(?:429|502|503|504)\b", text):
+        return "server_is_overloaded"
+    if status == "source_frames_failed" or kind == "source_frames":
+        return "source_frames_failed"
+    if status == "analysis_failed" or kind == "analysis":
+        return "analysis_failed"
+    if error_kind in {"generation_failed", "image_generation_failed"} or kind in {
+        "person",
+        "scene",
+        "integrated_frame",
+    }:
+        return "generation_failed"
+    return "unknown"
+
+
+def _auto_asset_failure_stage(status: str, error: dict[str, Any], category: str) -> str:
+    kind = str(error.get("kind") or "").strip().lower()
+    if status == "source_frames_failed" or category == "source_frames_failed":
+        return "source_frames"
+    if status == "analysis_failed" or kind == "analysis" or category == "analysis_failed":
+        return "analysis"
+    if category == "tos_upload_failed":
+        return "asset_publication"
+    if category == "quality_gate_failed":
+        return "quality_gate"
+    if category in {"identity_review_required", "identity_mapping_failed"}:
+        return "identity"
+    return "image_generation"
+
+
+def _auto_asset_dependency_ids(task: dict[str, Any]) -> list[int]:
+    values = task.get("logical_segments", [task.get("logical_segment", task.get("index"))])
+    if not isinstance(values, list):
+        values = [values]
+    return list(dict.fromkeys(int(item) for item in values if item is not None))
+
+
+def _auto_asset_failure_members(
+    job: LongVideoJob,
+    *,
+    request_tasks: list[dict[str, Any]] | None = None,
+    members: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    if members is not None:
+        selected = [item for item in members if isinstance(item, dict)]
+    else:
+        all_members = [item for item in _auto_asset_member_tasks(job) if isinstance(item, dict)]
+        logical_members = job.manifest.get("logical_member_tasks")
+        if request_tasks is not None and isinstance(logical_members, list):
+            members_by_index = {
+                int(item["index"]): item
+                for item in all_members
+                if item.get("index") is not None
+            }
+            selected = []
+            for request_task in request_tasks:
+                for index in _auto_asset_dependency_ids(request_task):
+                    selected.append(
+                        members_by_index.get(index)
+                        or {
+                            "index": index,
+                            "auto_asset_status": "missing",
+                            "auto_asset_errors": [
+                                {
+                                    "kind": "dependency",
+                                    "message": f"镜头 {index} 的自动资产记录不存在。",
+                                }
+                            ],
+                        }
+                    )
+        else:
+            selected = list(request_tasks) if request_tasks is not None else all_members
+    unique: dict[int, dict[str, Any]] = {}
+    for item in selected:
+        if not isinstance(item, dict) or item.get("index") is None:
+            continue
+        unique[int(item["index"])] = item
+    return [unique[index] for index in sorted(unique)]
+
+
+def _auto_asset_image_stage_started(member: dict[str, Any], records: list[dict[str, Any]]) -> bool:
+    status = str(member.get("auto_asset_status") or "planned")
+    if status in {"building", "masters_ready", "degraded", "ready"}:
+        return True
+    assets = member.get("auto_assets") if isinstance(member.get("auto_assets"), dict) else {}
+    if any(assets.get(key) for key in ("people", "scenes", "integrated_frames")):
+        return True
+    return any(record["stage"] in {"image_generation", "asset_publication", "quality_gate"} for record in records)
+
+
+def _seedance_request_attempted(task: dict[str, Any]) -> bool:
+    if int(task.get("attempts") or 0) > 0:
+        return True
+    return str(task.get("status") or "") in {
+        "running",
+        "retrying",
+        "retrying_without_source_video",
+        "success",
+        "failed",
+        "blocked_by_provider_policy",
+    }
+
+
+def _auto_asset_failure_summary(
+    job: LongVideoJob,
+    *,
+    request_tasks: list[dict[str, Any]] | None = None,
+    members: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    selected_members = _auto_asset_failure_members(job, request_tasks=request_tasks, members=members)
+    failed_members = []
+    for item in selected_members:
+        status = str(item.get("auto_asset_status") or "planned")
+        errors = item.get("auto_asset_errors")
+        has_errors = isinstance(errors, list) and any(isinstance(error, dict) for error in errors)
+        if status not in {"ready", "planned", "building", "masters_ready"} or has_errors:
+            failed_members.append(item)
+    all_members = [item for item in _auto_asset_member_tasks(job) if isinstance(item, dict) and item.get("index") is not None]
+    total_shot_count = len({int(item["index"]) for item in all_members}) or len(selected_members)
+    category_groups: dict[str, dict[str, Any]] = {}
+    failed_shots: list[dict[str, Any]] = []
+    analysis_started = False
+    analysis_failed_indexes: set[int] = set()
+    image_started_indexes: set[int] = set()
+
+    for member in failed_members:
+        index = int(member["index"])
+        status = str(member.get("auto_asset_status") or "planned")
+        raw_errors = member.get("auto_asset_errors")
+        errors = [item for item in raw_errors if isinstance(item, dict)] if isinstance(raw_errors, list) else []
+        if not errors:
+            errors = [{"message": f"自动资产状态为 {status}，但没有记录具体错误。"}]
+        records: list[dict[str, Any]] = []
+        shot_categories: list[str] = []
+        for sequence, error in enumerate(errors):
+            category = _classify_auto_asset_failure(status, error)
+            stage = _auto_asset_failure_stage(status, error, category)
+            attempts = max(0, int(error.get("attempts") or 0))
+            if stage == "analysis":
+                attempts = max(attempts, int(member.get("auto_asset_analysis_attempts") or 0))
+                analysis_started = analysis_started or attempts > 0 or status == "analysis_failed"
+                analysis_failed_indexes.add(index)
+            provider_details = _auto_asset_provider_error_details(error.get("message"))
+            record = {
+                "shot_index": index,
+                "status": status,
+                "category": category,
+                "stage": stage,
+                "attempts": attempts,
+                "message": _sanitize_auto_asset_failure_text(error.get("message")),
+                **provider_details,
+                "sequence": sequence,
+            }
+            records.append(record)
+            if category not in shot_categories:
+                shot_categories.append(category)
+            group = category_groups.setdefault(
+                category,
+                {
+                    "category": category,
+                    "label": _AUTO_ASSET_FAILURE_CATEGORY_DETAILS[category][0],
+                    "suggestion": _AUTO_ASSET_FAILURE_CATEGORY_DETAILS[category][1],
+                    "shot_indexes": set(),
+                    "error_record_count": 0,
+                    "attempts": 0,
+                    "representative_error": None,
+                },
+            )
+            group["shot_indexes"].add(index)
+            group["error_record_count"] += 1
+            group["attempts"] = max(int(group["attempts"]), attempts)
+            if group["representative_error"] is None:
+                group["representative_error"] = {
+                    key: record[key]
+                    for key in (
+                        "shot_index",
+                        "stage",
+                        "attempts",
+                        "http_status",
+                        "provider_code",
+                        "provider_message",
+                        "message",
+                    )
+                }
+        if _auto_asset_image_stage_started(member, records):
+            image_started_indexes.add(index)
+        failed_shots.append(
+            {
+                "index": index,
+                "status": status,
+                "categories": sorted(
+                    shot_categories,
+                    key=lambda value: _AUTO_ASSET_FAILURE_CATEGORY_ORDER.index(value),
+                ),
+                "attempts": max((record["attempts"] for record in records), default=0),
+            }
+        )
+
+    categories: list[dict[str, Any]] = []
+    for category in _AUTO_ASSET_FAILURE_CATEGORY_ORDER:
+        group = category_groups.get(category)
+        if group is None:
+            continue
+        shot_indexes = sorted(group.pop("shot_indexes"))
+        categories.append(
+            {
+                **group,
+                "shot_indexes": shot_indexes,
+                "failed_shot_count": len(shot_indexes),
+            }
+        )
+
+    video_tasks = [item for item in job.manifest.get("tasks", []) if isinstance(item, dict)]
+    seedance_started_groups = sorted(
+        int(item["index"])
+        for item in video_tasks
+        if item.get("index") is not None and _seedance_request_attempted(item)
+    )
+    if not analysis_started and any(member.get("auto_asset_analysis") for member in failed_members):
+        analysis_started = True
+    image_started = bool(image_started_indexes)
+    seedance_started = bool(seedance_started_groups)
+    if analysis_failed_indexes:
+        image_not_started_reason = "analysis_failed"
+    elif any(str(item.get("auto_asset_status") or "") == "source_frames_failed" for item in failed_members):
+        image_not_started_reason = "source_frames_failed"
+    elif any(str(item.get("auto_asset_status") or "") == "identity_review_required" for item in failed_members):
+        image_not_started_reason = "identity_review_required"
+    else:
+        image_not_started_reason = "auto_asset_failure"
+    return {
+        "version": 1,
+        "kind": "auto_asset_failure_summary",
+        "failed_shot_count": len(failed_members),
+        "total_shot_count": total_shot_count,
+        "scope_shot_count": len(selected_members),
+        "failed_shot_indexes": [int(item["index"]) for item in failed_members],
+        "blocked_group_indexes": sorted(
+            int(item["index"])
+            for item in (request_tasks or [])
+            if isinstance(item, dict) and item.get("index") is not None
+        ),
+        "categories": categories,
+        "failed_shots": failed_shots,
+        "stage_state": {
+            "analysis": {
+                "started": analysis_started,
+                "failed_shot_count": len(analysis_failed_indexes),
+            },
+            "image_generation": {
+                "started": image_started,
+                "started_shot_count": len(image_started_indexes),
+                "not_started_reason": "" if image_started else image_not_started_reason,
+            },
+            "seedance": {
+                "started": seedance_started,
+                "started_group_count": len(seedance_started_groups),
+                "started_group_indexes": seedance_started_groups,
+                "not_started_reason": "" if seedance_started else "auto_asset_failure",
+            },
+        },
+    }
+
+
+def _format_shot_indexes(indexes: list[int]) -> str:
+    if not indexes:
+        return "无"
+    ranges: list[str] = []
+    start = previous = indexes[0]
+    for index in indexes[1:]:
+        if index == previous + 1:
+            previous = index
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = index
+    ranges.append(str(start) if start == previous else f"{start}-{previous}")
+    return "、".join(ranges)
+
+
+def _format_auto_asset_failure_summary(summary: dict[str, Any]) -> str:
+    failed = int(summary.get("failed_shot_count") or 0)
+    total = int(summary.get("total_shot_count") or failed)
+    stage_state = summary.get("stage_state") if isinstance(summary.get("stage_state"), dict) else {}
+    analysis = stage_state.get("analysis") if isinstance(stage_state.get("analysis"), dict) else {}
+    image = stage_state.get("image_generation") if isinstance(stage_state.get("image_generation"), dict) else {}
+    seedance = stage_state.get("seedance") if isinstance(stage_state.get("seedance"), dict) else {}
+    seedance_text = "已尝试提交部分请求" if seedance.get("started") else "尚未启动"
+    if analysis.get("failed_shot_count"):
+        analysis_text = "已启动但失败"
+    elif analysis.get("started"):
+        analysis_text = "已启动"
+    else:
+        analysis_text = "未启动"
+    image_text = "已启动但未完成" if image.get("started") else "未启动"
+    lines = [
+        f"自动参考素材准备失败：{failed}/{total} 个镜头不可用，Seedance {seedance_text}。",
+        f"阶段状态：人物/背景分析{analysis_text}；图片生成{image_text}；Seedance {seedance_text}。",
+    ]
+    for item in summary.get("categories", []):
+        if not isinstance(item, dict):
+            continue
+        indexes = [int(index) for index in item.get("shot_indexes", [])]
+        attempts = int(item.get("attempts") or 0)
+        attempt_text = f"，最多尝试 {attempts} 次" if attempts else ""
+        lines.append(
+            f"- {item.get('label') or item.get('category')}：{int(item.get('failed_shot_count') or 0)} 个镜头"
+            f"（镜头 {_format_shot_indexes(indexes)}）{attempt_text}。"
+        )
+        representative = item.get("representative_error")
+        if isinstance(representative, dict):
+            provider_parts = []
+            if representative.get("http_status"):
+                provider_parts.append(f"HTTP {representative['http_status']}")
+            if representative.get("provider_code"):
+                provider_parts.append(str(representative["provider_code"]))
+            provider_prefix = f"（{' / '.join(provider_parts)}）" if provider_parts else ""
+            provider_message = str(representative.get("provider_message") or "").strip()
+            detail = provider_message or str(representative.get("message") or "未记录具体错误。")
+            lines.append(f"  代表性错误{provider_prefix}：{detail}")
+        suggestion = str(item.get("suggestion") or "").strip()
+        if suggestion:
+            lines.append(f"  处理建议：{suggestion}")
+    return "\n".join(lines)
+
+
+def _persist_job_auto_asset_failure_summary(
+    job: LongVideoJob,
+    request_tasks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    summary = _auto_asset_failure_summary(job, request_tasks=request_tasks)
+    job.manifest["auto_asset_failure_summary"] = summary
+    _atomic_write_json(job.manifest_path, job.manifest)
+    return summary
 
 
 def _emit_auto_asset_progress(
@@ -4957,6 +5680,8 @@ def _merge_auto_asset_cache_entry(cache: dict[str, Any], entry: dict[str, Any]) 
                 identity_keys.append(identity_key)
             _append_candidate_index(cache, "person", identity_key, person_id)
         _append_source_observations(record, update.get("source_observations") or [])
+        if isinstance(update.get("master_quality"), dict):
+            record["master_quality"] = deepcopy(update["master_quality"])
         if isinstance(entry.get("publication"), dict):
             record["publication"] = deepcopy(entry["publication"])
         if isinstance(update.get("publication"), dict):
@@ -5036,6 +5761,7 @@ def _create_auto_person_asset(
     visual_style: str = AUTO_ASSET_STYLE_WESTERN,
     style_prompt: str = "",
     enforce_identity_gate: bool = False,
+    validate_person_master: bool = False,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     source_images: list[Any] = []
     if person.get("first_bbox"):
@@ -5167,6 +5893,26 @@ def _create_auto_person_asset(
             image_quality=image_quality,
             image_provider=image_provider,
         )
+        master_quality = None
+        if validate_person_master and eligible_for_master:
+            master_quality = _evaluate_person_master_quality(
+                source_images=source_images,
+                candidate=image,
+                person=person,
+                model=analysis_model,
+                visual_style=visual_style,
+                style_prompt=style_prompt,
+            )
+            if master_quality.get("verdict") != "approved":
+                return None, {
+                    "kind": "person",
+                    "slot": str(person.get("slot") or ""),
+                    "error_kind": "quality_gate_failed",
+                    "message": "人物母版未通过目标风格验收：" + (
+                        "；".join(_as_string_list(master_quality.get("reasons"))) or "没有合格结果"
+                    ),
+                    "quality": master_quality,
+                }
         path = root / "people" / f"{person['slot']}.png"
         _save_image_tensor(image, path)
         person_id = _asset_record_id(root.name, person["slot"], person.get("identity_key") or "person")
@@ -5194,6 +5940,9 @@ def _create_auto_person_asset(
             "cache_update": cache_update,
             "suspected_matches": suspected_matches,
         }
+        if master_quality is not None:
+            entry["master_quality"] = master_quality
+            cache_update["master_quality"] = master_quality
         return entry, None
     except Exception as exc:
         return None, {
@@ -5362,15 +6111,31 @@ def _create_auto_scene_asset(
         }
 
 
-def _integrated_frame_specs(task: dict[str, Any]) -> list[dict[str, Any]]:
+def _integrated_frame_specs(
+    task: dict[str, Any],
+    *,
+    restyle_scope: str = RESTYLE_SCOPE_FULL_FRAME,
+    reuse_threshold: float = AUTO_ASSET_DEFAULT_REUSE_THRESHOLD,
+) -> list[dict[str, Any]]:
     assets = task.get("auto_assets") if isinstance(task.get("auto_assets"), dict) else {}
     source_frames = assets.get("source_frames") if isinstance(assets.get("source_frames"), dict) else {}
+    if _normalize_restyle_scope(restyle_scope) == RESTYLE_SCOPE_PERSON_ONLY:
+        # 仅人物转绘不生成场景母版：整帧规格直接来源于源帧，背景由源帧原样提供。
+        expected_frames = _auto_asset_expected_frame_roles(task, reuse_threshold=reuse_threshold)
+        specs: list[dict[str, Any]] = []
+        start_source = _asset_path_if_file(source_frames.get("source_start"))
+        if start_source is not None:
+            specs.append({"role": "frame_start", "source_path": start_source, "scene": None})
+        end_source = _asset_path_if_file(source_frames.get("source_end"))
+        if "frame_end" in expected_frames and end_source is not None:
+            specs.append({"role": "frame_end", "source_path": end_source, "scene": None})
+        return specs
     scenes = {
         str(item.get("role") or ""): item
         for item in assets.get("scenes", [])
         if isinstance(item, dict)
     }
-    specs: list[dict[str, Any]] = []
+    specs = []
     start_source = _asset_path_if_file(source_frames.get("source_start"))
     start_scene = scenes.get("scene_start")
     if start_source is not None and isinstance(start_scene, dict):
@@ -5422,10 +6187,11 @@ def _integrated_frame_attempt(
     visual_style: str,
     style_prompt: str,
     retry_reasons: list[str] | None = None,
+    restyle_scope: str = RESTYLE_SCOPE_FULL_FRAME,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     role = str(spec["role"])
     source_path = Path(spec["source_path"])
-    scene = spec["scene"]
+    scene = spec.get("scene") if isinstance(spec.get("scene"), dict) else {}
     source_frame = _load_image_file(source_path)
     person_entries, _warnings = _eligible_person_master_entries(task)
     exact_integrated_path = _asset_path_if_file(scene.get("integrated_frame_path"))
@@ -5481,6 +6247,7 @@ def _integrated_frame_attempt(
                 visual_style=visual_style,
                 style_prompt=style_prompt,
                 retry_reasons=retry_reasons,
+                restyle_scope=restyle_scope,
             ),
             image_model=image_model,
             image_quality=image_quality,
@@ -5498,6 +6265,7 @@ def _integrated_frame_attempt(
             model=analysis_model,
             visual_style=visual_style,
             style_prompt=style_prompt,
+            restyle_scope=restyle_scope,
         )
         return {
             "role": role,
@@ -5585,6 +6353,8 @@ def _build_integrated_frames(
     visual_style: str,
     style_prompt: str,
     progress_bar: ProgressBar | None = None,
+    restyle_scope: str = RESTYLE_SCOPE_FULL_FRAME,
+    reuse_threshold: float = AUTO_ASSET_DEFAULT_REUSE_THRESHOLD,
 ) -> tuple[int, list[dict[str, Any]]]:
     tasks = _auto_asset_member_tasks(job)
     work: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -5609,7 +6379,7 @@ def _build_integrated_frames(
             for item in task.get("auto_asset_errors", [])
             if isinstance(item, dict) and item.get("kind") != "integrated_frame"
         ]
-        for spec in _integrated_frame_specs(task):
+        for spec in _integrated_frame_specs(task, restyle_scope=restyle_scope, reuse_threshold=reuse_threshold):
             all_specs.append((task, spec))
             if str(spec["role"]) not in existing:
                 work.append((task, spec))
@@ -5660,6 +6430,7 @@ def _build_integrated_frames(
             visual_style=visual_style,
             style_prompt=style_prompt,
             retry_reasons=reasons,
+            restyle_scope=restyle_scope,
         )
         return task, spec, entry, error
 
@@ -5769,8 +6540,15 @@ def _build_integrated_frames(
             continue
         task_index = int(task["index"])
         assets = task.get("auto_assets") if isinstance(task.get("auto_assets"), dict) else {}
-        integrated = [entries_by_task[task_index][spec["role"]] for spec in _integrated_frame_specs(task) if spec["role"] in entries_by_task[task_index]]
-        expected_roles = [str(spec["role"]) for spec in _integrated_frame_specs(task)]
+        integrated = [
+            entries_by_task[task_index][spec["role"]]
+            for spec in _integrated_frame_specs(task, restyle_scope=restyle_scope, reuse_threshold=reuse_threshold)
+            if spec["role"] in entries_by_task[task_index]
+        ]
+        expected_roles = [
+            str(spec["role"])
+            for spec in _integrated_frame_specs(task, restyle_scope=restyle_scope, reuse_threshold=reuse_threshold)
+        ]
         approved_roles = {
             str(item.get("role"))
             for item in integrated
@@ -5845,12 +6623,14 @@ def build_long_video_auto_assets(
     image_quality = str(options.get("image_quality") or "medium")
     image_provider = str(options.get("image_provider") or "WisArt")
     visual_style = _normalize_auto_asset_style(options.get("visual_style"))
+    restyle_scope = _restyle_scope_from_options(options)
+    person_only_scope = restyle_scope == RESTYLE_SCOPE_PERSON_ONLY
     style_prompt = str(job.prompt or "")
     reuse_threshold = float(options.get("reuse_threshold", AUTO_ASSET_DEFAULT_REUSE_THRESHOLD))
     force_rerun_assets = bool(options.get("force_rerun_assets", False))
     requires_integrated_frames = (
         get_video_engine_adapter(job.engine).key == "seedance"
-        and bool(options.get("use_integrated_frame_references", False))
+        and (bool(options.get("use_integrated_frame_references", False)) or person_only_scope)
     )
     enforce_identity_gate = int(job.manifest.get("processing_contract_version", 0)) in {
         V3_PROCESSING_CONTRACT_VERSION,
@@ -5922,6 +6702,7 @@ def build_long_video_auto_assets(
                 root,
                 reuse_threshold=reuse_threshold,
                 require_integrated_frames=requires_integrated_frames,
+                restyle_scope=restyle_scope,
             ):
                 reused_assets = task.get("auto_assets") if isinstance(task.get("auto_assets"), dict) else {}
                 reused_people = [dict(item) for item in reused_assets.get("people", []) if isinstance(item, dict)]
@@ -6186,13 +6967,17 @@ def build_long_video_auto_assets(
                 analysis["shot_stability"] in {"transition", "uncertain"}
                 or background["same_scene_confidence"] < reuse_threshold
             )
-            scene_specs = [
-                ("scene_start", frames[0], background["first_description"], f"{background['scene_key']}_start")
-            ]
-            if needs_end_scene:
-                scene_specs.append(
-                    ("scene_end", frames[2], background["last_description"], f"{background['scene_key']}_end")
-                )
+            if person_only_scope:
+                # 仅人物转绘：背景保持原视频，不生成任何场景母版。
+                scene_specs = []
+            else:
+                scene_specs = [
+                    ("scene_start", frames[0], background["first_description"], f"{background['scene_key']}_start")
+                ]
+                if needs_end_scene:
+                    scene_specs.append(
+                        ("scene_end", frames[2], background["last_description"], f"{background['scene_key']}_end")
+                    )
             person_order = [str(item["slot"]) for item in analysis["people"]]
             scene_order = [str(item[0]) for item in scene_specs]
             task_pending: list[tuple[str, str, Any]] = []
@@ -6241,6 +7026,7 @@ def build_long_video_auto_assets(
                                 visual_style=visual_style,
                                 style_prompt=style_prompt,
                                 enforce_identity_gate=enforce_identity_gate,
+                                validate_person_master=enforce_identity_gate,
                             ),
                             max_retries=job.max_retries,
                         )
@@ -6498,6 +7284,8 @@ def build_long_video_auto_assets(
             visual_style=visual_style,
             style_prompt=style_prompt,
             progress_bar=progress,
+            restyle_scope=restyle_scope,
+            reuse_threshold=reuse_threshold,
         )
         submitted_count += integrated_request_count
 
@@ -6515,6 +7303,15 @@ def build_long_video_auto_assets(
     )
     if not preserve_job_status:
         job.manifest["status"] = asset_stage_status
+    failure_summary = (
+        _auto_asset_failure_summary(job, members=tasks)
+        if asset_stage_status == "auto_assets_partial_failure"
+        else None
+    )
+    if failure_summary is not None:
+        job.manifest["auto_asset_failure_summary"] = failure_summary
+    else:
+        job.manifest.pop("auto_asset_failure_summary", None)
     _atomic_write_json(job.manifest_path, job.manifest)
     _emit_auto_asset_progress(
         job,
@@ -6528,6 +7325,7 @@ def build_long_video_auto_assets(
             "integrated_frame_request_count": integrated_request_count,
             "image_worker_count": worker_count,
             "status_counts": _auto_asset_status_counts(job),
+            **({"failure_summary": failure_summary} if failure_summary is not None else {}),
         },
     )
     report = {
@@ -6545,6 +7343,7 @@ def build_long_video_auto_assets(
         "manifest": str(job.manifest_path),
         "cancelled": cancelled,
         "asset_stage_status": asset_stage_status,
+        **({"failure_summary": failure_summary} if failure_summary is not None else {}),
         "check": (
             "检查每个镜头的首尾源帧、人物/场景母版和素材库状态；默认参考包优先发送人物 asset_id 与场景母版。"
             if not requires_integrated_frames
@@ -6646,6 +7445,7 @@ def _v3_group_pack_context(job: LongVideoJob) -> dict[str, Any]:
             int(item["index"]): item for item in _auto_asset_member_tasks(job) if isinstance(item, dict)
         },
         "visual_style": _normalize_auto_asset_style(options.get("visual_style")),
+        "restyle_scope": _restyle_scope_from_options(options),
         "send_source_video": bool(options.get("send_source_video", True)),
         "is_manual_batch": is_manual_batch,
         "cross_batch_frame": (
@@ -6755,11 +7555,18 @@ def _v3_pack_single_group_reference(
     )
     members = [members_by_index.get(index) for index in member_ids]
     if any(member is None or member.get("auto_asset_status") != "ready" for member in members):
+        failure_summary = _auto_asset_failure_summary(job, request_tasks=[task])
         task["reference_package_status"] = "blocked_by_asset_failure"
         task["reference_package"] = {"version": package_version, "items": []}
         task["reference_roles"] = []
         task["status"] = "blocked_by_asset_failure"
-        return {"index": task["index"], "status": task["reference_package_status"]}
+        task["reference_package_failure"] = failure_summary
+        return {
+            "index": task["index"],
+            "status": task["reference_package_status"],
+            "failure_summary": failure_summary,
+        }
+    task.pop("reference_package_failure", None)
     ready_members = [member for member in members if member is not None]
 
     master_items: list[dict[str, Any]] = []
@@ -6934,6 +7741,7 @@ def _v3_pack_single_group_reference(
         visual_style=visual_style,
         send_source_video=send_source_video,
         reference_timeline=reference_timeline,
+        restyle_scope=_normalize_restyle_scope(context.get("restyle_scope")),
     )
     package_key_source = {
         "version": package_version,
@@ -7025,6 +7833,15 @@ def pack_long_video_auto_references(job: LongVideoJob) -> tuple[LongVideoJob, st
         MANUAL_BATCH_PROCESSING_CONTRACT_VERSION,
     }:
         reports, _tasks = _v3_pack_group_references(job)
+        blocked_tasks = [
+            task for task in job.manifest["tasks"] if task.get("reference_package_status") == "blocked_by_asset_failure"
+        ]
+        if blocked_tasks:
+            job.manifest["auto_asset_failure_summary"] = _auto_asset_failure_summary(
+                job, request_tasks=blocked_tasks
+            )
+        else:
+            job.manifest.pop("auto_asset_failure_summary", None)
         job.manifest["status"] = "auto_references_packed"
         _atomic_write_json(job.manifest_path, job.manifest)
         preview_paths = [
@@ -7048,15 +7865,29 @@ def pack_long_video_auto_references(job: LongVideoJob) -> tuple[LongVideoJob, st
             ),
             "reference_image_limit": adapter.reference_image_limit,
             "tasks": reports,
+            **(
+                {"failure_summary": job.manifest["auto_asset_failure_summary"]}
+                if isinstance(job.manifest.get("auto_asset_failure_summary"), dict)
+                else {}
+            ),
             "manifest": str(job.manifest_path),
         }
         return job, json.dumps(report, ensure_ascii=False, indent=2), previews
     for task in job.manifest["tasks"]:
         assets = task.get("auto_assets")
         if not isinstance(assets, dict) or task.get("auto_asset_status") != "ready":
+            failure_summary = _auto_asset_failure_summary(job, request_tasks=[task])
             task["reference_package_status"] = "blocked_by_asset_failure"
-            reports.append({"index": task["index"], "status": task["reference_package_status"]})
+            task["reference_package_failure"] = failure_summary
+            reports.append(
+                {
+                    "index": task["index"],
+                    "status": task["reference_package_status"],
+                    "failure_summary": failure_summary,
+                }
+            )
             continue
+        task.pop("reference_package_failure", None)
         root = _auto_asset_root(job, task) / "reference_package"
         root.mkdir(parents=True, exist_ok=True)
         people = [
@@ -7098,10 +7929,20 @@ def pack_long_video_auto_references(job: LongVideoJob) -> tuple[LongVideoJob, st
             soft_continuity=int(task["index"]) > 1,
             visual_style=visual_style,
             send_source_video=send_source_video,
+            restyle_scope=_restyle_scope_from_options(options),
         )
         if task.get("status") != "success":
             task["status"] = "matched" if package else "auto_asset_failed"
         reports.append({"index": task["index"], "status": task["reference_package_status"], "roles": task["reference_roles"]})
+    blocked_tasks = [
+        task for task in job.manifest["tasks"] if task.get("reference_package_status") == "blocked_by_asset_failure"
+    ]
+    if blocked_tasks:
+        job.manifest["auto_asset_failure_summary"] = _auto_asset_failure_summary(
+            job, request_tasks=blocked_tasks
+        )
+    else:
+        job.manifest.pop("auto_asset_failure_summary", None)
     job.manifest["status"] = "auto_references_packed"
     _atomic_write_json(job.manifest_path, job.manifest)
     preview_paths = [
@@ -7118,6 +7959,11 @@ def pack_long_video_auto_references(job: LongVideoJob) -> tuple[LongVideoJob, st
         "visual_style": visual_style,
         "send_source_video": send_source_video,
         "tasks": reports,
+        **(
+            {"failure_summary": job.manifest["auto_asset_failure_summary"]}
+            if isinstance(job.manifest.get("auto_asset_failure_summary"), dict)
+            else {}
+        ),
         "manifest": str(job.manifest_path),
     }
     return job, json.dumps(report, ensure_ascii=False, indent=2), previews
@@ -7530,6 +8376,8 @@ def _auto_resume_settings_match(candidate: dict[str, Any], values: dict[str, Any
     current_options.pop("force_rerun_assets", None)
     candidate_options.setdefault("target_resource_type", "")
     current_options.setdefault("target_resource_type", "")
+    candidate_options.setdefault("restyle_scope", RESTYLE_SCOPE_FULL_FRAME)
+    current_options.setdefault("restyle_scope", RESTYLE_SCOPE_FULL_FRAME)
     if (
         not candidate_options["target_resource_type"]
         and candidate_options.get("visual_style") == AUTO_ASSET_STYLE_ANIME
@@ -7630,6 +8478,7 @@ def _inherit_manual_batch_retry_asset_root(
     new_job_dir: Path,
     task: dict[str, Any],
     reuse_threshold: float = AUTO_ASSET_DEFAULT_REUSE_THRESHOLD,
+    restyle_scope: str = RESTYLE_SCOPE_FULL_FRAME,
 ) -> None:
     old_root = old_job_dir / "shot_assets" / f"shot_{int(task['index']):04d}"
     new_root = new_job_dir / "shot_assets" / f"shot_{int(task['index']):04d}"
@@ -7646,7 +8495,9 @@ def _inherit_manual_batch_retry_asset_root(
         if key in task:
             task[key] = _rebase_auto_asset_paths(task[key], old_root=old_root, new_root=new_root)
     task["auto_asset_reused_from"] = str(old_root)
-    _reset_manual_batch_quality_retry_state(task, new_root, reuse_threshold=reuse_threshold)
+    _reset_manual_batch_quality_retry_state(
+        task, new_root, reuse_threshold=reuse_threshold, restyle_scope=restyle_scope
+    )
     _write_auto_asset_manifest(new_root, task)
 
 
@@ -7655,6 +8506,7 @@ def _reset_manual_batch_quality_retry_state(
     root: Path,
     *,
     reuse_threshold: float,
+    restyle_scope: str = RESTYLE_SCOPE_FULL_FRAME,
 ) -> bool:
     """Reopen only a retry whose base masters are intact and frame quality failed."""
     if task.get("auto_asset_status") not in {"degraded", "failed"}:
@@ -7667,7 +8519,9 @@ def _reset_manual_batch_quality_retry_state(
         "generation_or_quality_failed",
     } for item in errors):
         return False
-    if not _auto_asset_task_masters_complete(task, root, reuse_threshold=reuse_threshold):
+    if not _auto_asset_task_masters_complete(
+        task, root, reuse_threshold=reuse_threshold, restyle_scope=restyle_scope
+    ):
         return False
     assets = task.get("auto_assets")
     if isinstance(assets, dict):
@@ -7912,7 +8766,12 @@ def plan_long_video_auto_asset_job(
     use_integrated_frame_references: bool = False,
     manual_batch: dict[str, Any] | None = None,
     identity_mapping: Any = "",
+    restyle_scope: str = RESTYLE_SCOPE_FULL_FRAME,
 ) -> LongVideoJob:
+    normalized_scope = _normalize_restyle_scope(restyle_scope)
+    if normalized_scope == RESTYLE_SCOPE_PERSON_ONLY:
+        # 仅人物转绘依赖整帧参考图携带原背景，强制开启整帧生成。
+        use_integrated_frame_references = True
     options = {
         "image_model": str(image_model or "gpt-image-2"),
         "image_quality": str(image_quality or "medium"),
@@ -7926,6 +8785,10 @@ def plan_long_video_auto_asset_job(
         "use_integrated_frame_references": bool(use_integrated_frame_references),
         "target_resource_type": str(target_resource_type or ""),
     }
+    if normalized_scope == RESTYLE_SCOPE_PERSON_ONLY:
+        # full_frame 不写键：旧 manifest 的 auto_asset_options 里没有 restyle_scope，
+        # 写默认值会破坏既有任务的断点复用比较。
+        options["restyle_scope"] = normalized_scope
     contract_version = int(processing_contract_version)
     if contract_version in {V3_PROCESSING_CONTRACT_VERSION, MANUAL_BATCH_PROCESSING_CONTRACT_VERSION}:
         options.update(
@@ -8129,6 +8992,7 @@ def plan_long_video_auto_asset_v3_job(
                     new_job_dir=job_dir,
                     task=task,
                     reuse_threshold=float((auto_asset_options or {}).get("reuse_threshold", AUTO_ASSET_DEFAULT_REUSE_THRESHOLD)),
+                    restyle_scope=_restyle_scope_from_options(auto_asset_options),
                 )
         member_tasks.append(task)
 
@@ -8382,9 +9246,8 @@ def _parallel_video_task_worker(
 
     if job.manifest.get("asset_mode") == "auto_shot_assets":
         if task_copy.get("reference_package_status") != "ready":
-            raise ValueError(
-                f"第 {index} 段自动参考素材不可用，状态为 {task_copy.get('reference_package_status')}。"
-            )
+            summary = _auto_asset_failure_summary(job, request_tasks=[task_copy])
+            raise ValueError(_format_auto_asset_failure_summary(summary))
         references, roles = _references_from_auto_package(adapter, task_copy, previous_end_frame=None)
     else:
         selected = task_copy.get("selected_assets")
@@ -8461,6 +9324,7 @@ def _parallel_video_task_worker(
                             or AUTO_ASSET_STYLE_WESTERN
                         ),
                         send_source_video=False,
+                        restyle_scope=_restyle_scope_from_options(job.manifest.get("auto_asset_options")),
                     )
                     prompt = (
                         f"{prompt}\n\n并行生成模式：本段独立生成，不提供上一段末帧，也不等待其他分段；"
@@ -8497,6 +9361,7 @@ def generate_long_video_segments_parallel(job: LongVideoJob, concurrency: int = 
     completed_segments: list[dict[str, Any]] = []
     failed_segments: list[dict[str, Any]] = []
     pending: list[dict[str, Any]] = []
+    asset_blocked_tasks: list[dict[str, Any]] = []
 
     for task in tasks:
         result_path = Path(task["result"])
@@ -8513,15 +9378,24 @@ def generate_long_video_segments_parallel(job: LongVideoJob, concurrency: int = 
             continue
         if job.manifest.get("asset_mode") == "auto_shot_assets" and task.get("reference_package_status") != "ready":
             task["status"] = "blocked_by_asset_failure"
-            error = {
-                "sequence": int(task["index"]),
-                "error": f"自动参考素材不可用：{task.get('reference_package_status')}",
-            }
-            failed_segments.append(error)
+            asset_blocked_tasks.append(task)
             continue
         task["status"] = "running"
         task["attempts"] = 0
         pending.append(task)
+
+    asset_failure_summary = None
+    if asset_blocked_tasks:
+        asset_failure_summary = _persist_job_auto_asset_failure_summary(job, asset_blocked_tasks)
+        asset_failure_message = _format_auto_asset_failure_summary(asset_failure_summary)
+        failed_segments.extend(
+            {
+                "sequence": int(task["index"]),
+                "error": asset_failure_message,
+                "failure_summary": asset_failure_summary,
+            }
+            for task in asset_blocked_tasks
+        )
 
     progress = ProgressBar(max(1, total))
     progress.update_absolute(len(completed_segments), max(1, total))
@@ -8542,7 +9416,9 @@ def generate_long_video_segments_parallel(job: LongVideoJob, concurrency: int = 
         if failed_segments:
             job.manifest["status"] = "failed"
             _atomic_write_json(job.manifest_path, job.manifest)
-            raise RuntimeError(f"并发视频生成有 {len(failed_segments)} 个分段不可用，断点已保存到 {job.manifest_path}")
+            if asset_failure_summary is not None:
+                raise RuntimeError(_format_auto_asset_failure_summary(asset_failure_summary))
+            raise RuntimeError(f"并发视频生成有 {len(failed_segments)} 个分段不可用，断点已保存。")
         job.manifest["status"] = "segments_generated"
         _atomic_write_json(job.manifest_path, job.manifest)
         return job
@@ -8739,7 +9615,13 @@ def _generate_single_group_segment(
         raise ValueError(f"第 {task['index']} 段无法读取原视频画面。")
     if job.manifest.get("asset_mode") == "auto_shot_assets":
         if task.get("reference_package_status") != "ready":
-            raise ValueError(f"第 {task['index']} 段自动参考素材不可用，状态为 {task.get('reference_package_status')}。")
+            blocked_tasks = [
+                item
+                for item in job.manifest.get("tasks", [])
+                if isinstance(item, dict) and item.get("reference_package_status") != "ready"
+            ]
+            summary = _persist_job_auto_asset_failure_summary(job, blocked_tasks or [task])
+            raise ValueError(_format_auto_asset_failure_summary(summary))
         if is_manual_batch and int(task["index"]) == 1 and cross_batch_frame is not None:
             continuity_frame = cross_batch_frame
             continuity_role = "cross_batch_final_frame"
@@ -8847,6 +9729,7 @@ def _generate_single_group_segment(
                     soft_continuity=bool(task.get("uses_previous_end_frame")),
                     visual_style=str(options.get("visual_style") or AUTO_ASSET_STYLE_WESTERN),
                     send_source_video=False,
+                    restyle_scope=_restyle_scope_from_options(options),
                 )
                 _atomic_write_json(job.manifest_path, job.manifest)
                 continue
@@ -8892,6 +9775,15 @@ def _finish_segment_generation(job: LongVideoJob, context: dict[str, Any]) -> No
 
 
 def generate_long_video_segments(job: LongVideoJob) -> LongVideoJob:
+    if job.manifest.get("asset_mode") == "auto_shot_assets":
+        blocked_tasks = [
+            task
+            for task in job.manifest.get("tasks", [])
+            if isinstance(task, dict) and task.get("reference_package_status") != "ready"
+        ]
+        if blocked_tasks:
+            summary = _persist_job_auto_asset_failure_summary(job, blocked_tasks)
+            raise ValueError(_format_auto_asset_failure_summary(summary))
     context = _segment_generation_context(job)
     previous_end_frame = None
     progress = ProgressBar(len(job.manifest["tasks"]))
@@ -8915,6 +9807,7 @@ _PIPELINE_ASSET_FAILURE_STATUSES = {
     "failed",
     "degraded",
     "identity_review_required",
+    "identity_mapping_failed",
 }
 
 
@@ -8940,7 +9833,14 @@ def _wait_pipeline_group_assets(
     member_ids = _pipeline_group_member_ids(task)
     while True:
         if producer_error:
-            raise RuntimeError(f"资产生成线程已失败：{producer_error[0]}") from producer_error[0]
+            summary = _auto_asset_failure_summary(job, request_tasks=[task])
+            if summary.get("failed_shot_count"):
+                job.manifest["auto_asset_failure_summary"] = summary
+                _atomic_write_json(job.manifest_path, job.manifest)
+                raise RuntimeError(_format_auto_asset_failure_summary(summary)) from producer_error[0]
+            raise RuntimeError(
+                f"资产生成线程意外失败：{_sanitize_auto_asset_failure_text(producer_error[0])}"
+            ) from producer_error[0]
         members_by_index = {
             int(item["index"]): item
             for item in _auto_asset_member_tasks(job)
@@ -8954,21 +9854,21 @@ def _wait_pipeline_group_assets(
             return
         blocked = {index: status for index, status in statuses.items() if status in _PIPELINE_ASSET_FAILURE_STATUSES}
         if blocked:
-            detail = "，".join(f"镜头 {index} 状态 {status}" for index, status in sorted(blocked.items()))
             task["reference_package_status"] = "blocked_by_asset_failure"
             task["status"] = "blocked_by_asset_failure"
+            summary = _auto_asset_failure_summary(job, request_tasks=[task])
+            task["reference_package_failure"] = summary
+            job.manifest["auto_asset_failure_summary"] = summary
             _atomic_write_json(job.manifest_path, job.manifest)
-            raise RuntimeError(
-                f"第 {task['index']} 组依赖的自动资产不可用（{detail}），断点已保存到 {job.manifest_path}"
-            )
+            raise RuntimeError(_format_auto_asset_failure_summary(summary))
         if not producer.is_alive():
-            pending = "，".join(f"镜头 {index} 状态 {status}" for index, status in sorted(statuses.items()) if status != "ready")
             task["reference_package_status"] = "blocked_by_asset_failure"
             task["status"] = "blocked_by_asset_failure"
+            summary = _auto_asset_failure_summary(job, request_tasks=[task])
+            task["reference_package_failure"] = summary
+            job.manifest["auto_asset_failure_summary"] = summary
             _atomic_write_json(job.manifest_path, job.manifest)
-            raise RuntimeError(
-                f"资产生成已结束，但第 {task['index']} 组仍缺少素材（{pending}），断点已保存到 {job.manifest_path}"
-            )
+            raise RuntimeError(_format_auto_asset_failure_summary(summary))
         time.sleep(PIPELINE_ASSET_WAIT_POLL_SECONDS)
 
 
@@ -9053,9 +9953,21 @@ def generate_long_video_pipeline(job: LongVideoJob, image_concurrency: int = 0) 
             progress.update(1)
         producer.join()
         if producer_error:
-            raise RuntimeError(f"资产生成线程已失败：{producer_error[0]}") from producer_error[0]
+            failure_summary = _auto_asset_failure_summary(job, request_tasks=tasks)
+            if failure_summary.get("failed_shot_count"):
+                job.manifest["auto_asset_failure_summary"] = failure_summary
+                _atomic_write_json(job.manifest_path, job.manifest)
+                raise RuntimeError(_format_auto_asset_failure_summary(failure_summary)) from producer_error[0]
+            raise RuntimeError(
+                f"资产生成线程意外失败：{_sanitize_auto_asset_failure_text(producer_error[0])}"
+            ) from producer_error[0]
         asset_stage_status = str(producer_report.get("asset_stage_status") or "")
         if asset_stage_status != "auto_assets_ready":
+            failure_summary = _auto_asset_failure_summary(job, request_tasks=tasks)
+            if failure_summary.get("failed_shot_count"):
+                job.manifest["auto_asset_failure_summary"] = failure_summary
+                _atomic_write_json(job.manifest_path, job.manifest)
+                raise RuntimeError(_format_auto_asset_failure_summary(failure_summary))
             raise RuntimeError(f"自动资产阶段没有完整完成，当前状态：{asset_stage_status or 'unknown'}。")
 
         _finish_segment_generation(job, context)

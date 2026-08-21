@@ -68,6 +68,7 @@ from .long_video import (
     plan_long_video_auto_asset_job,
     MANUAL_BATCH_PROCESSING_CONTRACT_VERSION,
     MANUAL_BATCH_CONTRACT,
+    RESTYLE_SCOPE_PERSON_ONLY,
     _manual_batch_read_state,
     select_manual_batch_range,
     select_continuous_shot_range,
@@ -558,11 +559,16 @@ class CompanyFixedColumnImagePreview(IO.ComfyNode):
     def execute(cls, images: torch.Tensor, columns: str, gap: int = 8):
         if not isinstance(images, torch.Tensor) or images.ndim != 4 or images.shape[0] < 1:
             raise ValueError("固定列数预览需要至少一张 IMAGE。")
-        preview = UI.PreviewImage(images, cls=cls)
+        saved = UI.ImageSaveHelper.get_save_images_ui(
+            images,
+            filename_prefix="company_remote/fixed_column_previews/preview",
+            cls=cls,
+            compress_level=4,
+        )
         return IO.NodeOutput(
             images,
             ui={
-                "fixed_grid_images": preview.values,
+                "fixed_grid_images": saved.results,
                 "fixed_grid_columns": (int(columns),),
                 "fixed_grid_gap": (int(gap),),
             },
@@ -1507,6 +1513,91 @@ def _target_resource_settings(target_resource_type: str, prompt: str, negative_p
     return normalized_type, visual_style, resolved_prompt, resolved_negative
 
 
+PERSON_ONLY_WESTERN_LONG_VIDEO_PROMPT = (
+    "只把本段原视频中的人物替换为参考图片中的欧美人物，背景保持原视频画面完全不变。"
+    "人物参考图是替换后人物身份、脸、发型、服装、配饰和整体造型的唯一视觉依据；"
+    "人物必须整体重设计为符合当代欧美审美的外国人物，而不是只更换面孔。"
+    "整帧参考图展示了『人物已替换、背景保持原视频』的最终画面标准，输出的每一帧都必须符合这一标准。"
+    "背景、环境、建筑、家具、道具、天空、地面、光线方向、色调和摄影质感必须与原视频保持一致，"
+    "不得风格化背景、不得重绘环境、不得改变背景中的任何物体。"
+    "严格保持实际人物数量、人物关系、主要剧情顺序、镜头构图和场景功能，"
+    "替换后的人物与原背景自然融合，从第一帧到最后一帧保持人物身份、整体造型和背景稳定一致。"
+)
+
+PERSON_ONLY_WESTERN_LONG_VIDEO_NEGATIVE_PROMPT = (
+    "只换脸，亚洲面孔残留，原人物残留，原服装残留，背景被重绘，背景风格化，背景变化，环境改变，"
+    "建筑改变，家具改变，道具改变，背景调色，光线方向改变，背景跳变，人物与背景光影不匹配，"
+    "人物悬浮，人物复制，身份变化，多余人物，肢体畸形，额外手指，字幕，文字，Logo，水印"
+)
+
+PERSON_ONLY_PROMPT_TEMPLATES = {
+    TARGET_RESOURCE_WESTERN: PERSON_ONLY_WESTERN_LONG_VIDEO_PROMPT,
+    TARGET_RESOURCE_PHOTOREAL: (
+        "只把本段原视频中的人物替换为参考图片中的高质量真人影视角色，背景保持原视频画面完全不变。"
+        "人物参考图是替换后人物身份与造型的唯一视觉依据；整帧参考图展示了『人物已替换、背景保持原视频』"
+        "的最终画面标准。背景、环境、光线方向、色调和摄影质感必须与原视频保持一致，不得风格化或重绘背景。"
+        "严格保持实际人物数量、人物关系、剧情顺序、镜头构图和场景功能，"
+        "替换后的人物与原背景自然融合，从第一帧到最后一帧保持人物身份与背景稳定一致。"
+    ),
+    TARGET_RESOURCE_ANIME: (
+        "只把本段原视频中的人物替换为参考图片中的高质量二维动漫角色，背景保持原视频画面完全不变。"
+        "人物参考图是替换后人物身份与造型的唯一视觉依据；整帧参考图展示了『人物已动漫化、背景保持原视频』"
+        "的最终画面标准。背景、环境、光线方向、色调和摄影质感必须与原视频保持一致，"
+        "禁止把背景动漫化、禁止重绘环境。严格保持实际人物数量、人物关系、剧情顺序、镜头构图和场景功能，"
+        "动漫人物与原背景自然融合，从第一帧到最后一帧保持人物造型与背景稳定一致。"
+    ),
+    TARGET_RESOURCE_CG_3D: (
+        "只把本段原视频中的人物替换为参考图片中的高质量 3D 游戏 CG 角色，背景保持原视频画面完全不变。"
+        "人物参考图是替换后人物身份与造型的唯一视觉依据；整帧参考图展示了『人物已替换、背景保持原视频』"
+        "的最终画面标准。背景、环境、光线方向、色调和摄影质感必须与原视频保持一致，"
+        "禁止把背景 CG 化、禁止重绘环境。严格保持实际人物数量、人物关系、剧情顺序、镜头构图和场景功能，"
+        "CG 人物与原背景自然融合，从第一帧到最后一帧保持人物造型与背景稳定一致。"
+    ),
+    TARGET_RESOURCE_COMIC: (
+        "只把本段原视频中的人物替换为参考图片中的高质量漫画插画角色，背景保持原视频画面完全不变。"
+        "人物参考图是替换后人物身份与造型的唯一视觉依据；整帧参考图展示了『人物已替换、背景保持原视频』"
+        "的最终画面标准。背景、环境、光线方向、色调和摄影质感必须与原视频保持一致，"
+        "禁止把背景漫画化、禁止重绘环境。严格保持实际人物数量、人物关系、剧情顺序、镜头构图和场景功能，"
+        "漫画人物与原背景自然融合，从第一帧到最后一帧保持人物造型与背景稳定一致。"
+    ),
+}
+
+PERSON_ONLY_GENERIC_NEGATIVE_PROMPT = (
+    "原人物残留，只换脸，背景被重绘，背景风格化，背景变化，环境改变，建筑改变，家具改变，道具改变，"
+    "背景调色，光线方向改变，背景跳变，人物与背景光影不匹配，人物悬浮，风格漂移，人物复制，身份变化，"
+    "多余人物，肢体畸形，额外手指，字幕，文字，Logo，水印"
+)
+
+PERSON_ONLY_NEGATIVE_TEMPLATES = {
+    TARGET_RESOURCE_WESTERN: PERSON_ONLY_WESTERN_LONG_VIDEO_NEGATIVE_PROMPT,
+    TARGET_RESOURCE_PHOTOREAL: "动漫脸，卡通脸，塑料皮肤，假脸，" + PERSON_ONLY_GENERIC_NEGATIVE_PROMPT,
+    TARGET_RESOURCE_ANIME: "真人脸残留，半真人半动漫，写实人物残留，" + PERSON_ONLY_GENERIC_NEGATIVE_PROMPT,
+    TARGET_RESOURCE_CG_3D: "真人脸残留，低模，塑料材质，半真人半CG，" + PERSON_ONLY_GENERIC_NEGATIVE_PROMPT,
+    TARGET_RESOURCE_COMIC: "真人脸残留，半真人半漫画，贴纸感，" + PERSON_ONLY_GENERIC_NEGATIVE_PROMPT,
+}
+
+
+def _person_only_target_resource_settings(
+    target_resource_type: str,
+    prompt: str,
+    negative_prompt: str,
+) -> tuple[str, str, str, str]:
+    """仅人物转绘的预设：类型/风格判定与整帧转绘版一致，但提示词换成保留背景语义。"""
+    normalized_type, visual_style, resolved_prompt, resolved_negative = _target_resource_settings(
+        target_resource_type,
+        prompt,
+        negative_prompt,
+    )
+    if normalized_type == TARGET_RESOURCE_CUSTOM:
+        return normalized_type, visual_style, resolved_prompt, resolved_negative
+    return (
+        normalized_type,
+        visual_style,
+        PERSON_ONLY_PROMPT_TEMPLATES[normalized_type],
+        PERSON_ONLY_NEGATIVE_TEMPLATES[normalized_type],
+    )
+
+
 class CompanyLongVideoAnimeAssetPlanner(IO.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -1794,6 +1885,89 @@ class CompanyLongVideoManualBatchPlannerV1(CompanyLongVideoAnimeAssetPlannerV3):
             use_integrated_frame_references=bool(use_integrated_frame_references),
             manual_batch=dict(batch_config),
             identity_mapping=identity_mapping_json,
+        )
+        status = json.dumps(job.manifest, ensure_ascii=False, indent=2)
+        return IO.NodeOutput(job, status, str(job.manifest_path), ui={"text": (status,)})
+
+
+class CompanyLongVideoManualBatchPersonOnlyPlannerV1(CompanyLongVideoManualBatchPlannerV1):
+    @classmethod
+    def define_schema(cls):
+        schema = super().define_schema()
+        schema.node_id = "CompanyLongVideoManualBatchPersonOnlyPlannerV1"
+        schema.display_name = "手动批次 Seedance 人物转绘任务规划 v1（保留背景）"
+        schema.description = (
+            "为当前可审阅批次建立 contract=4 仅人物转绘任务：只把人物替换为目标风格，"
+            "背景保持原视频画面。不生成场景母版，自动开启整帧参考图；不会改动旧 v3 任务缓存。"
+        )
+        defaults = {
+            "prompt": PERSON_ONLY_WESTERN_LONG_VIDEO_PROMPT,
+            "negative_prompt": PERSON_ONLY_WESTERN_LONG_VIDEO_NEGATIVE_PROMPT,
+            "target_resource_type": TARGET_RESOURCE_WESTERN,
+            "use_integrated_frame_references": True,
+        }
+        for entry in schema.inputs:
+            if entry.id in defaults:
+                entry.default = defaults[entry.id]
+            if entry.id == "target_resource_type":
+                entry.tooltip = "切换后自动填写对应的仅人物转绘提示词，并同步改变人物资产的生成风格；背景始终保持原视频。"
+            if entry.id == "use_integrated_frame_references":
+                entry.tooltip = "仅人物转绘依赖整帧参考图携带原背景，本节点始终按开启执行。"
+        return schema
+
+    @classmethod
+    def execute(
+        cls,
+        shot_plan: Any,
+        prompt: str,
+        model: str,
+        analysis_model: str = DEFAULT_OPENAI_TEXT_MODEL,
+        image_model: str = "gpt-image-2",
+        image_quality: str = "medium",
+        reuse_threshold: float = 0.92,
+        max_retries: int = 2,
+        resume: bool = True,
+        force_rerun: bool = False,
+        force_rerun_assets: bool = False,
+        negative_prompt: str = PERSON_ONLY_WESTERN_LONG_VIDEO_NEGATIVE_PROMPT,
+        image_provider: str = GPT_IMAGE_PROVIDER_WISART,
+        target_resource_type: str = "",
+        use_original_audio: bool = False,
+        use_integrated_frame_references: bool = True,
+        identity_mapping_json: str = "",
+    ):
+        normalized_type, visual_style, resolved_prompt, resolved_negative = _person_only_target_resource_settings(
+            target_resource_type,
+            prompt,
+            negative_prompt,
+        )
+        batch_config = (shot_plan.config or {}).get("manual_batch", {})
+        if not isinstance(batch_config, dict) or not batch_config.get("state_path"):
+            raise ValueError("请先连接“手动批次范围与续接控制”节点的当前批次镜头计划。")
+        job = plan_long_video_auto_asset_job(
+            shot_plan=shot_plan,
+            prompt=resolved_prompt,
+            engine="seedance",
+            model=str(model or "Seedance 2.0 Fast"),
+            ai_model=analysis_model,
+            image_model=image_model,
+            image_quality=image_quality,
+            image_provider=image_provider,
+            reuse_threshold=float(reuse_threshold),
+            max_retries=int(max_retries),
+            resume=bool(resume),
+            force_rerun=bool(force_rerun),
+            force_rerun_assets=bool(force_rerun_assets),
+            negative_prompt=resolved_negative,
+            visual_style=visual_style,
+            send_source_video=False,
+            target_resource_type=normalized_type,
+            processing_contract_version=MANUAL_BATCH_PROCESSING_CONTRACT_VERSION,
+            use_original_audio=bool(use_original_audio),
+            use_integrated_frame_references=True,
+            manual_batch=dict(batch_config),
+            identity_mapping=identity_mapping_json,
+            restyle_scope=RESTYLE_SCOPE_PERSON_ONLY,
         )
         status = json.dumps(job.manifest, ensure_ascii=False, indent=2)
         return IO.NodeOutput(job, status, str(job.manifest_path), ui={"text": (status,)})
@@ -3588,6 +3762,7 @@ NODE_CLASS_MAPPINGS = {
     "CompanyLongVideoLengthRangeSelector": CompanyLongVideoLengthRangeSelector,
     "CompanyLongVideoManualBatchRangeSelector": CompanyLongVideoManualBatchRangeSelector,
     "CompanyLongVideoManualBatchPlannerV1": CompanyLongVideoManualBatchPlannerV1,
+    "CompanyLongVideoManualBatchPersonOnlyPlannerV1": CompanyLongVideoManualBatchPersonOnlyPlannerV1,
     "CompanyLongVideoManualBatchFinalizerV1": CompanyLongVideoManualBatchFinalizerV1,
     "CompanyLongVideoDurationAdapter": CompanyLongVideoDurationAdapter,
     "CompanyLongVideoSegmentPlanner": CompanyLongVideoSegmentPlanner,
@@ -3639,6 +3814,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CompanyLongVideoLengthRangeSelector": "按时长/百分比选择生成范围",
     "CompanyLongVideoManualBatchRangeSelector": "手动批次范围与续接控制",
     "CompanyLongVideoManualBatchPlannerV1": "手动批次 Seedance 资产任务规划 v1",
+    "CompanyLongVideoManualBatchPersonOnlyPlannerV1": "手动批次 Seedance 人物转绘任务规划 v1（保留背景）",
     "CompanyLongVideoManualBatchFinalizerV1": "提交当前批次并等待人工审阅",
     "CompanyLongVideoDurationAdapter": "镜头时长适配与任务规划",
     "CompanyLongVideoSegmentPlanner": "长视频切分与任务规划",

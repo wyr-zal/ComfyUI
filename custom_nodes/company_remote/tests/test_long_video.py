@@ -83,18 +83,135 @@ class LongVideoTests(unittest.TestCase):
         self.assertEqual(result, "有效结果")
         self.assertEqual(submit.call_count, 2)
 
-    def test_fixed_column_image_preview_returns_individual_images(self) -> None:
+    def test_auto_asset_failure_summary_groups_real_root_causes_and_stage_state(self) -> None:
+        members = []
+        for index in range(1, 15):
+            if index == 4:
+                message = (
+                    'Remote request failed with HTTP 502: {"error":{"type":"service_unavailable_error",'
+                    '"code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}'
+                )
+            else:
+                message = (
+                    'Remote request failed with HTTP 503: {"error":{"message":"auth_unavailable: '
+                    'no auth available (providers=codex, model=gpt-5.6-terra)",'
+                    '"type":"server_error","code":"internal_server_error"}}'
+                )
+            members.append(
+                {
+                    "index": index,
+                    "auto_asset_status": "analysis_failed",
+                    "auto_asset_analysis_attempts": 3,
+                    "auto_asset_errors": [{"kind": "analysis", "message": message, "attempts": 3}],
+                }
+            )
+        tasks = [
+            {"index": 1, "logical_segments": [1, 2], "reference_package_status": "blocked_by_asset_failure"},
+            {"index": 2, "logical_segments": [3, 4], "reference_package_status": "blocked_by_asset_failure"},
+            {"index": 3, "logical_segments": [5, 6], "reference_package_status": "blocked_by_asset_failure"},
+            {"index": 4, "logical_segments": [7, 8, 9, 10], "reference_package_status": "blocked_by_asset_failure"},
+            {"index": 5, "logical_segments": [11, 12, 13, 14], "reference_package_status": "blocked_by_asset_failure"},
+        ]
+        job = cast(
+            long_video.LongVideoJob,
+            SimpleNamespace(manifest={"logical_member_tasks": members, "tasks": tasks}),
+        )
+
+        summary = long_video._auto_asset_failure_summary(job, request_tasks=tasks)
+        categories = {item["category"]: item for item in summary["categories"]}
+        formatted = long_video._format_auto_asset_failure_summary(summary)
+
+        self.assertEqual(summary["failed_shot_count"], 14)
+        self.assertEqual(summary["total_shot_count"], 14)
+        self.assertEqual(summary["blocked_group_indexes"], [1, 2, 3, 4, 5])
+        self.assertEqual(categories["auth_unavailable"]["failed_shot_count"], 13)
+        self.assertEqual(categories["auth_unavailable"]["attempts"], 3)
+        self.assertEqual(categories["auth_unavailable"]["representative_error"]["http_status"], 503)
+        self.assertEqual(categories["auth_unavailable"]["representative_error"]["provider_code"], "internal_server_error")
+        self.assertEqual(categories["server_is_overloaded"]["failed_shot_count"], 1)
+        self.assertEqual(categories["server_is_overloaded"]["shot_indexes"], [4])
+        self.assertFalse(summary["stage_state"]["image_generation"]["started"])
+        self.assertFalse(summary["stage_state"]["seedance"]["started"])
+        self.assertIn("14/14 个镜头不可用", formatted)
+        self.assertIn("远端服务无可用认证：13 个镜头", formatted)
+        self.assertIn("HTTP 502 / server_is_overloaded", formatted)
+        self.assertIn("图片生成未启动", formatted)
+        self.assertIn("Seedance 尚未启动", formatted)
+
+    def test_auto_asset_failure_summary_deduplicates_shots_and_sanitizes_secrets(self) -> None:
+        unsafe = (
+            'HTTP 503 Authorization: Bearer secret-token api_key=sk-supersecret '
+            'url=https://example.com/result.png?X-Amz-Signature=secret '
+            'path=C:\\private\\source.png data:image/png;base64,AAAAAA '
+            '{"error":{"code":"server_is_overloaded","message":"busy"}}'
+        )
+        member = {
+            "index": 1,
+            "auto_asset_status": "degraded",
+            "auto_asset_errors": [
+                {"kind": "person", "error_kind": "generation_failed", "message": unsafe, "attempts": 2},
+                {"kind": "scene", "error_kind": "generation_failed", "message": unsafe, "attempts": 3},
+            ],
+            "auto_asset_warnings": [{"kind": "person_asset_library", "message": "仅素材库 warning"}],
+        }
+        task = {"index": 1, "logical_segments": [1], "reference_package_status": "blocked_by_asset_failure"}
+        job = cast(
+            long_video.LongVideoJob,
+            SimpleNamespace(manifest={"logical_member_tasks": [member], "tasks": [task]}),
+        )
+
+        summary = long_video._auto_asset_failure_summary(job, request_tasks=[task])
+        encoded = json.dumps(summary, ensure_ascii=False)
+        category = summary["categories"][0]
+
+        self.assertEqual(summary["failed_shot_count"], 1)
+        self.assertEqual(category["failed_shot_count"], 1)
+        self.assertEqual(category["error_record_count"], 2)
+        self.assertEqual(category["attempts"], 3)
+        self.assertTrue(summary["stage_state"]["image_generation"]["started"])
+        self.assertNotIn("secret-token", encoded)
+        self.assertNotIn("sk-supersecret", encoded)
+        self.assertNotIn("X-Amz-Signature", encoded)
+        self.assertNotIn("C:\\private", encoded)
+        self.assertNotIn("AAAAAA", encoded)
+        self.assertNotIn("素材库 warning", encoded)
+
+    def test_auto_asset_failure_summary_ignores_ready_member_warnings(self) -> None:
+        member = {
+            "index": 1,
+            "auto_asset_status": "ready",
+            "auto_asset_errors": [],
+            "auto_asset_warnings": [{"kind": "person_asset_library", "message": "素材库暂时不可用"}],
+        }
+        task = {"index": 1, "logical_segments": [1], "reference_package_status": "ready", "attempts": 0}
+        job = cast(
+            long_video.LongVideoJob,
+            SimpleNamespace(manifest={"logical_member_tasks": [member], "tasks": [task]}),
+        )
+
+        summary = long_video._auto_asset_failure_summary(job, request_tasks=[task])
+
+        self.assertEqual(summary["failed_shot_count"], 0)
+        self.assertEqual(summary["categories"], [])
+
+    def test_fixed_column_image_preview_saves_persistent_output_images(self) -> None:
         images = torch.stack(
             [torch.full((40, 80, 3), index / 6.0) for index in range(6)],
             dim=0,
         )
         with tempfile.TemporaryDirectory() as directory:
-            with mock.patch.object(company_nodes.folder_paths, "get_temp_directory", return_value=directory):
+            with mock.patch.object(company_nodes.folder_paths, "get_output_directory", return_value=directory):
                 result = company_nodes.CompanyFixedColumnImagePreview.execute(images, columns="2", gap=8)
-        self.assertIs(result[0], images)
-        self.assertEqual(len(result.ui["fixed_grid_images"]), 6)
-        self.assertEqual(result.ui["fixed_grid_columns"], (2,))
-        self.assertEqual(result.ui["fixed_grid_gap"], (8,))
+
+            descriptors = result.ui["fixed_grid_images"]
+            self.assertIs(result[0], images)
+            self.assertEqual(len(descriptors), 6)
+            self.assertEqual(result.ui["fixed_grid_columns"], (2,))
+            self.assertEqual(result.ui["fixed_grid_gap"], (8,))
+            expected_subfolder = Path("company_remote") / "fixed_column_previews"
+            self.assertTrue(all(item["type"] == "output" for item in descriptors))
+            self.assertTrue(all(Path(item["subfolder"]) == expected_subfolder for item in descriptors))
+            self.assertTrue(all((Path(directory) / item["subfolder"] / item["filename"]).is_file() for item in descriptors))
 
     def test_fixed_column_preview_restores_images_from_node_properties(self) -> None:
         script_path = Path(__file__).resolve().parents[1] / "web/fixed_column_image_preview.js"
@@ -192,6 +309,98 @@ class LongVideoTests(unittest.TestCase):
             self.assertEqual(preview["converted"][0]["asset_library_status"], "active")
             self.assertEqual(preview["converted"][1]["kind"], "scene")
             self.assertEqual(preview["converted"][1]["asset_library_status"], "not_registered")
+
+    def test_person_master_quality_gate_rejects_unconverted_western_master(self) -> None:
+        quality = long_video._normalize_person_master_quality(
+            {
+                "target_style_score": 0.03,
+                "source_style_residue": 0.96,
+                "subject_contract_score": 0.98,
+                "subject_count_match": True,
+            },
+            visual_style=long_video.AUTO_ASSET_STYLE_WESTERN,
+        )
+
+        self.assertEqual(quality["verdict"], "retry")
+        self.assertTrue(any("目标风格强度不足" in item for item in quality["reasons"]))
+        self.assertTrue(any("原样残留过多" in item for item in quality["reasons"]))
+
+    def test_person_master_quality_gate_approves_strong_western_master(self) -> None:
+        quality = long_video._normalize_person_master_quality(
+            {
+                "target_style_score": 0.95,
+                "source_style_residue": 0.03,
+                "subject_contract_score": 0.93,
+                "subject_count_match": True,
+            },
+            visual_style=long_video.AUTO_ASSET_STYLE_WESTERN,
+        )
+
+        self.assertEqual(quality["verdict"], "approved")
+        self.assertEqual(quality["reasons"], [])
+
+    def test_person_master_quality_gate_preserves_nonhuman_subjects(self) -> None:
+        quality = long_video._normalize_person_master_quality(
+            {
+                "target_style_score": 0.00,
+                "source_style_residue": 1.00,
+                "subject_contract_score": 0.96,
+                "subject_count_match": True,
+                "subject_kind": "animal",
+            },
+            visual_style=long_video.AUTO_ASSET_STYLE_WESTERN,
+        )
+
+        self.assertEqual(quality["verdict"], "approved")
+        self.assertEqual(quality["subject_kind"], "animal")
+
+    def test_person_master_generation_rejects_unqualified_asset_before_cache_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frames = torch.ones((3, 400, 400, 3))
+            person = {
+                "slot": "P1",
+                "appearance": "年轻女性，黑色盘发，浅色立领上衣",
+                "first_bbox": [0.05, 0.05, 0.95, 0.95],
+                "last_bbox": [0.05, 0.05, 0.95, 0.95],
+                "identity_key": "heroine",
+                "reuse_confidence": 1.0,
+            }
+            with (
+                mock.patch.object(
+                    long_video,
+                    "_generate_auto_asset_image",
+                    return_value=torch.full((1, 256, 256, 3), 0.5),
+                ),
+                mock.patch.object(
+                    long_video,
+                    "_evaluate_person_master_quality",
+                    return_value={
+                        "verdict": "retry",
+                        "reasons": ["人物母版目标风格强度不足（0.03）"],
+                    },
+                ) as quality_check,
+            ):
+                entry, error = long_video._create_auto_person_asset(
+                    root=root / "shot_0001",
+                    person=person,
+                    frames=frames,
+                    cache=long_video._empty_auto_asset_cache(),
+                    analysis_model="gpt-5.4",
+                    image_model="gpt-image-2",
+                    image_quality="low",
+                    image_provider="AI-Zero-Token",
+                    reuse_threshold=0.92,
+                    visual_style=long_video.AUTO_ASSET_STYLE_WESTERN,
+                    validate_person_master=True,
+                )
+
+        self.assertIsNone(entry)
+        self.assertEqual(error["error_kind"], "quality_gate_failed")
+        self.assertIn("目标风格强度不足", error["message"])
+        self.assertEqual(error["quality"]["verdict"], "retry")
+        self.assertFalse((root / "shot_0001" / "people" / "P1.png").exists())
+        quality_check.assert_called_once()
 
     def test_integrated_frame_quality_gate_rejects_weak_conversion(self) -> None:
         quality = long_video._normalize_integrated_frame_quality(
@@ -1132,6 +1341,61 @@ class LongVideoTests(unittest.TestCase):
         self.assertIsInstance(references[0], company_client.SeedanceAssetReference)
         self.assertEqual(references[0].asset_id, "asset-person")
         self.assertIsInstance(references[1], torch.Tensor)
+
+    def test_v3_packer_persists_failure_summary_for_all_group_members(self) -> None:
+        member_one = {
+            "index": 1,
+            "auto_asset_status": "analysis_failed",
+            "auto_asset_analysis_attempts": 3,
+            "auto_asset_errors": [
+                {
+                    "kind": "analysis",
+                    "attempts": 3,
+                    "message": 'HTTP 503: {"error":{"code":"internal_server_error","message":"auth_unavailable: no auth available"}}',
+                }
+            ],
+        }
+        member_two = {
+            "index": 2,
+            "auto_asset_status": "degraded",
+            "auto_asset_errors": [
+                {"kind": "person", "error_kind": "tos_upload_failed", "message": "TOS 写入失败"}
+            ],
+        }
+        task = {"index": 1, "logical_segments": [1, 2]}
+        job = cast(
+            long_video.LongVideoJob,
+            SimpleNamespace(
+                engine="seedance",
+                manifest={
+                    "auto_asset_options": {},
+                    "logical_member_tasks": [member_one, member_two],
+                    "tasks": [task],
+                },
+            ),
+        )
+
+        report = long_video._v3_pack_single_group_reference(
+            job,
+            task,
+            {
+                "members_by_index": {1: member_one, 2: member_two},
+                "visual_style": "western",
+                "send_source_video": False,
+                "is_manual_batch": True,
+                "cross_batch_frame": "",
+                "package_version": "test",
+            },
+        )
+
+        self.assertEqual(task["reference_package_status"], "blocked_by_asset_failure")
+        self.assertEqual(task["status"], "blocked_by_asset_failure")
+        self.assertEqual(task["reference_package_failure"]["failed_shot_indexes"], [1, 2])
+        self.assertEqual(report["failure_summary"]["failed_shot_indexes"], [1, 2])
+        self.assertEqual(
+            {item["category"] for item in report["failure_summary"]["categories"]},
+            {"auth_unavailable", "tos_upload_failed"},
+        )
 
     def test_seedance_packer_prefers_active_people_and_scene_masters_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4215,6 +4479,116 @@ class LongVideoTests(unittest.TestCase):
         self.assertGreaterEqual(generated_report["output_duration"], 3.9)
         self.assertGreaterEqual(original_report["output_duration"], 3.9)
 
+    def test_segment_generator_surfaces_all_blocked_group_root_causes_before_seedance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            members = [
+                {
+                    "index": 1,
+                    "auto_asset_status": "analysis_failed",
+                    "auto_asset_analysis_attempts": 3,
+                    "auto_asset_errors": [
+                        {
+                            "kind": "analysis",
+                            "attempts": 3,
+                            "message": 'HTTP 503: {"error":{"code":"internal_server_error","message":"auth_unavailable: no auth available"}}',
+                        }
+                    ],
+                },
+                {
+                    "index": 2,
+                    "auto_asset_status": "degraded",
+                    "auto_asset_errors": [
+                        {
+                            "kind": "integrated_frame",
+                            "error_kind": "quality_gate_failed",
+                            "attempts": 2,
+                            "message": "整帧转绘未通过质量验收",
+                        }
+                    ],
+                },
+            ]
+            tasks = [
+                {"index": 1, "logical_segments": [1], "reference_package_status": "blocked_by_asset_failure"},
+                {"index": 2, "logical_segments": [2], "reference_package_status": "blocked_by_asset_failure"},
+            ]
+            job = cast(
+                long_video.LongVideoJob,
+                SimpleNamespace(
+                    manifest_path=root / "manifest.json",
+                    manifest={
+                        "asset_mode": "auto_shot_assets",
+                        "logical_member_tasks": members,
+                        "tasks": tasks,
+                    },
+                ),
+            )
+
+            with (
+                mock.patch.object(long_video, "_segment_generation_context") as context,
+                self.assertRaises(ValueError) as raised,
+            ):
+                long_video.generate_long_video_segments(job)
+
+            saved = json.loads(job.manifest_path.read_text(encoding="utf-8"))
+
+        message = str(raised.exception)
+        context.assert_not_called()
+        self.assertIn("2/2 个镜头不可用", message)
+        self.assertIn("远端服务无可用认证", message)
+        self.assertIn("转绘质量门控未通过", message)
+        self.assertIn("Seedance 尚未启动", message)
+        self.assertEqual(saved["auto_asset_failure_summary"]["failed_shot_indexes"], [1, 2])
+
+    def test_parallel_segment_generator_uses_same_asset_failure_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = {
+                "index": 1,
+                "logical_segments": [1],
+                "reference_package_status": "blocked_by_asset_failure",
+                "status": "planned",
+                "attempts": 0,
+                "result": str(root / "segment.mp4"),
+            }
+            job = cast(
+                long_video.LongVideoJob,
+                SimpleNamespace(
+                    engine="seedance",
+                    resume=False,
+                    force_rerun=False,
+                    job_dir=root,
+                    manifest_path=root / "manifest.json",
+                    manifest={
+                        "asset_mode": "auto_shot_assets",
+                        "processing_contract_version": 2,
+                        "auto_asset_options": {},
+                        "logical_member_tasks": [
+                            {
+                                "index": 1,
+                                "auto_asset_status": "analysis_failed",
+                                "auto_asset_errors": [
+                                    {
+                                        "kind": "analysis",
+                                        "attempts": 3,
+                                        "message": 'HTTP 502: {"error":{"code":"server_is_overloaded","message":"busy"}}',
+                                    }
+                                ],
+                            }
+                        ],
+                        "tasks": [task],
+                    },
+                ),
+            )
+
+            with self.assertRaises(RuntimeError) as raised:
+                long_video.generate_long_video_segments_parallel(job, concurrency=3)
+
+        message = str(raised.exception)
+        self.assertIn("1/1 个镜头不可用", message)
+        self.assertIn("远端服务过载或暂时不可用", message)
+        self.assertIn("Seedance 尚未启动", message)
+
     def test_v3_rejects_parallel_generation_node(self) -> None:
         job = cast(
             long_video.LongVideoJob,
@@ -4403,13 +4777,26 @@ class LongVideoTests(unittest.TestCase):
                 SimpleNamespace(
                     manifest_path=root / "manifest.json",
                     manifest={
-                        "logical_member_tasks": [{"index": 1, "auto_asset_status": "analysis_failed"}],
+                        "logical_member_tasks": [
+                            {
+                                "index": 1,
+                                "auto_asset_status": "analysis_failed",
+                                "auto_asset_analysis_attempts": 3,
+                                "auto_asset_errors": [
+                                    {
+                                        "kind": "analysis",
+                                        "attempts": 3,
+                                        "message": 'HTTP 503: {"error":{"code":"internal_server_error","message":"auth_unavailable: no auth available"}}',
+                                    }
+                                ],
+                            }
+                        ],
                         "tasks": [task],
                     },
                 ),
             )
 
-            with self.assertRaisesRegex(RuntimeError, "自动资产不可用"):
+            with self.assertRaisesRegex(RuntimeError, "远端服务无可用认证") as raised:
                 long_video._wait_pipeline_group_assets(
                     job,
                     task,
@@ -4417,6 +4804,10 @@ class LongVideoTests(unittest.TestCase):
                     producer_error=[],
                 )
 
+            saved = json.loads(job.manifest_path.read_text(encoding="utf-8"))
+
+        self.assertIn("Seedance 尚未启动", str(raised.exception))
+        self.assertEqual(saved["auto_asset_failure_summary"]["failed_shot_indexes"], [1])
         self.assertEqual(task["reference_package_status"], "blocked_by_asset_failure")
         self.assertEqual(task["status"], "blocked_by_asset_failure")
 
@@ -4443,7 +4834,7 @@ class LongVideoTests(unittest.TestCase):
                 ),
             )
 
-            with self.assertRaisesRegex(RuntimeError, "自动资产不可用"):
+            with self.assertRaisesRegex(RuntimeError, "人物素材上传失败") as raised:
                 long_video._wait_pipeline_group_assets(
                     job,
                     task,
@@ -4451,6 +4842,8 @@ class LongVideoTests(unittest.TestCase):
                     producer_error=[],
                 )
 
+        self.assertIn("TOS 写入失败", str(raised.exception))
+        self.assertIn("Seedance 尚未启动", str(raised.exception))
         self.assertEqual(task["reference_package_status"], "blocked_by_asset_failure")
         self.assertEqual(task["status"], "blocked_by_asset_failure")
 
